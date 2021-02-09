@@ -1,0 +1,489 @@
+﻿using FlyCapture2Managed;
+using FlyCapture2Managed.Gui;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media.Imaging;
+using UtilsLib;
+
+namespace gColorLib.Model
+{
+    public struct PtGreyCameraImage
+    {
+        public ManagedImage raw;
+        public ManagedImage converted;
+        public ManagedCamera cam;
+    }
+
+    public class PtGreyCamera : Camera
+    {
+        CameraControlDialog m_ctldlg;
+        ManagedCamera camera;
+
+        public override bool Connect()
+        {
+            bool result = false;
+            try
+            {
+                CameraSelectionDialog m_selDlg = new CameraSelectionDialog();
+                if (m_selDlg.ShowModal())
+                {
+                    ManagedPGRGuid[] guids = m_selDlg.GetSelectedCameraGuids();
+                    if (guids.Length == 0)
+                    {
+                        MessageBox.Show("Please select a camera", "No camera selected");
+                        return false;
+                    }
+
+                    camera = new ManagedCamera();
+                    m_ctldlg = new CameraControlDialog();
+                    camera.Connect(guids[0]);
+                    
+                    //initialise settings
+                    InitializeSettings();
+                    InitializeSettingsWB();
+
+                    CameraInfo ci = camera.GetCameraInfo();
+                    SerialNumber = ci.serialNumber;
+
+                    result = true;
+                }
+            }
+            catch (Exception /*ex*/)
+            {
+                //App.LogEntry.AddEntry("Failed to Connect to Point Grey Camera : " + ex.Message);
+                result = false;
+            }
+
+            return result;
+        }
+
+        public override void StartCapture(BackgroundWorker bw)
+        {
+            ManagedImage m_image = new ManagedImage();
+            ManagedImage m_converted = new ManagedImage();
+
+            try
+            {
+                camera.StopCapture();
+            }
+            catch (FC2Exception ex)
+            {
+                if (ex.Type != ErrorType.IsochNotStarted)
+                {
+                    throw;
+                }
+            }
+
+            camera.StartCapture();
+
+            PtGreyCameraImage helper = new PtGreyCameraImage();
+            helper.converted = m_converted;
+            helper.raw = m_image;
+            helper.cam = camera;
+
+            bw.RunWorkerAsync(helper);
+        }
+
+        
+        public override BitmapSource GetImage(DoWorkEventArgs e)
+        {
+            PtGreyCameraImage helper = (PtGreyCameraImage)e.Argument;
+            BitmapSource source;
+
+            helper.cam.RetrieveBuffer(helper.raw);
+            helper.raw.ConvertToBitmapSource(helper.converted);
+
+            //if ((Properties.Settings.Default.CropHeight == 0 && Properties.Settings.Default.CropWidth == 0) ||
+            //     (Properties.Settings.Default.CropHeight + Properties.Settings.Default.CropTop > helper.converted.bitmapsource.Height) ||
+            //     (Properties.Settings.Default.CropWidth + Properties.Settings.Default.CropLeft > helper.converted.bitmapsource.Width)
+            //    )
+            if ((AppSettings.Instance.CropHeight == 0 && AppSettings.Instance.CropWidth == 0) ||
+                (AppSettings.Instance.CropHeight + AppSettings.Instance.CropTop > helper.converted.bitmapsource.Height) ||
+                (AppSettings.Instance.CropWidth + AppSettings.Instance.CropLeft > helper.converted.bitmapsource.Width)
+            )
+            {
+                source = helper.converted.bitmapsource;
+                CropImageWidth = 0;
+                CropImageHeight = 0;
+            }
+            else
+            {
+                //source = new CroppedBitmap(helper.converted.bitmapsource,
+                //    new System.Windows.Int32Rect((int)Properties.Settings.Default.CropLeft,
+                //                                    (int)Properties.Settings.Default.CropTop,
+                //                                    (int)(Properties.Settings.Default.CropWidth == 0 ?
+                //                                            helper.converted.bitmapsource.Width : Properties.Settings.Default.CropWidth),
+                //                                    (int)(Properties.Settings.Default.CropHeight == 0 ?
+                //                                            helper.converted.bitmapsource.Height : Properties.Settings.Default.CropHeight)));
+                source = new CroppedBitmap(helper.converted.bitmapsource,
+                    new System.Windows.Int32Rect((int)AppSettings.Instance.CropLeft,
+                                                    (int)AppSettings.Instance.CropTop,
+                                                    (int)((int)AppSettings.Instance.CropWidth == 0 ?
+                                                            helper.converted.bitmapsource.Width : AppSettings.Instance.CropWidth),
+                                                    (int)((int)AppSettings.Instance.CropHeight == 0 ?
+                                                            helper.converted.bitmapsource.Height : AppSettings.Instance.CropHeight)));
+                CropImageWidth = source.Width;
+                CropImageHeight = source.Height;
+            }
+            source.Freeze();
+            ImageWidth = helper.converted.bitmapsource.Width;
+            ImageHeight = helper.converted.bitmapsource.Height;
+            
+            return source;
+        }
+
+
+        public override void DisConnect()
+        {
+            try
+            {
+                if (camera != null)
+                {
+                    camera.StopCapture();
+                    camera.Disconnect();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("PtGrey Disconnect : " + ex.Message);
+            }
+            finally
+            {
+
+            }
+        }
+
+        public override void EditCameraSettings()
+        {
+            if (m_ctldlg.IsVisible())
+            {
+                m_ctldlg.Disconnect();
+                m_ctldlg.Hide();
+            }
+            else
+            {
+                m_ctldlg.Connect(camera);
+                m_ctldlg.Show();
+            }
+        }
+
+
+        void SetCameraVideoModeAndFrameRate(VideoMode newVideoMode, FrameRate newFrameRate)
+        {
+            bool restartCapture = true;
+            try
+            {
+                camera.StopCapture();
+            }
+            catch (FC2Exception ex)
+            {
+                if (ex.Type != ErrorType.IsochNotStarted)
+                {
+                    throw;
+                }
+                else
+                    restartCapture = false;
+            }
+
+            try
+            {
+                camera.SetVideoModeAndFrameRate(newVideoMode, newFrameRate);
+            }
+            catch (FC2Exception /*ex*/)
+            {
+                throw;
+            }
+
+            if (restartCapture)
+            {
+                camera.StartCapture();
+            }
+        }
+
+
+        void SetAbsolutePropertyValue(PropertyType property, float newValue)
+        {
+            CameraProperty camProp = camera.GetProperty(property);
+            CameraPropertyInfo propInfo = camera.GetPropertyInfo(property);
+
+            if (!camProp.autoManualMode && propInfo.manualSupported && propInfo.absValSupported)
+            {
+                float difference = camProp.absValue - newValue;
+                if (difference != 0)
+                {
+                    // The brightness abs register sometimes starts drifting
+                    // due to a rounding error between the camera and the
+                    // actual value being held by the adjustment. To prevent
+                    // this, only apply the change to the camera if the
+                    // difference is greater than a specified amount.
+
+                    // Check if the difference is greater than 0.005f. 
+                    if (property != PropertyType.Brightness ||
+                        Math.Abs(difference) > 0.005f)
+                    {
+                        camProp.absControl = true;
+                        camProp.absValue = newValue;
+                        camera.SetProperty(camProp);
+                    }
+                }
+            }
+            else
+            {
+                throw new ApplicationException("Trying to set a property that cannot be adjusted");
+            }
+        }
+
+
+        public float GetPropertyValue(PropertyType property, bool absolute, bool valueB = false)
+        {
+            CameraProperty camProp = camera.GetProperty(property);
+
+            return (absolute ? camProp.absValue : (!valueB ? camProp.valueA : camProp.valueB));
+        }
+
+
+        public override void AdjustWhiteBalance(int increment, bool valueB, ref uint oldValue)
+        {
+            PropertyType property = PropertyType.WhiteBalance;
+
+            CameraProperty camProp = camera.GetProperty(property);
+            CameraPropertyInfo propInfo = camera.GetPropertyInfo(property);
+
+            camProp.absControl = false;
+            if (!valueB)
+            {
+                oldValue = camProp.valueA;
+
+                if (increment > 0)
+                    camProp.valueA = camProp.valueA + (uint)increment;
+                else
+                    camProp.valueA = camProp.valueA - (uint)(-1 * increment);
+            }
+            else
+            {
+                oldValue = camProp.valueB;
+
+                if (increment > 0)
+                    camProp.valueB = camProp.valueB + (uint)increment;
+                else
+                    camProp.valueB = camProp.valueB - (uint)(-1 * increment);
+            }
+            camera.SetProperty(camProp);
+        }
+
+        uint SetWhiteBalance(int newValue, bool valueB)
+        {
+            uint oldValue;
+            PropertyType property = PropertyType.WhiteBalance;
+
+            CameraProperty camProp = camera.GetProperty(property);
+            CameraPropertyInfo propInfo = camera.GetPropertyInfo(property);
+
+            camProp.absControl = false;
+            if (!valueB)//red
+            {
+                oldValue = camProp.valueA;
+                camProp.valueA = (uint)newValue;
+            }
+            else
+            {
+                oldValue = camProp.valueB;
+                camProp.valueB = (uint)newValue;
+            }
+            camera.SetProperty(camProp);
+            return oldValue;
+
+        }
+
+
+        void SetProprtyAutomaticSetting(PropertyType property, bool automatic)
+        {
+            CameraProperty camProp = camera.GetProperty(property);
+            if (camProp.autoManualMode != automatic) 
+            {
+                camProp.autoManualMode = automatic;
+                camera.SetProperty(camProp);
+            }
+        }
+
+        void SetProprtyEnabledSetting(PropertyType property, bool enabled)
+        {
+            CameraProperty camProp = camera.GetProperty(property);
+            camProp.onOff = enabled;
+            camera.SetProperty(camProp);
+        }
+
+        void SetProprtyOnePush(PropertyType property, bool onePush)
+        {
+            CameraProperty camProp = camera.GetProperty(property);
+
+            camProp.onePush = onePush;
+            camera.SetProperty(camProp);
+        }
+
+
+        public override void GetInitializationPropertyValues(Dictionary<CAMERA_PROPERTY, double> properties)
+        {
+            foreach (var key in properties.Keys.ToList())
+            {
+                switch (key)
+                {
+                    case CAMERA_PROPERTY.Shutter:
+                        properties[key] = Math.Round(GetPropertyValue(PropertyType.Shutter, true), 3);
+                        break;
+                    case CAMERA_PROPERTY.Temperature:
+                        properties[key] = (GetPropertyValue(PropertyType.Temperature, false) / 10.0) - 273.15;
+                        break;
+                    case CAMERA_PROPERTY.WhiteBalanceRed:
+                        properties[key] = GetPropertyValue(PropertyType.WhiteBalance, false, false);
+                        break;
+                    case CAMERA_PROPERTY.WhiteBalanceBlue:
+                        properties[key] = GetPropertyValue(PropertyType.WhiteBalance, false, true);
+                        break;
+                }
+            }
+        }
+
+        void InitializeSettings()
+        {
+            //first reset to default settings
+            camera.RestoreFromMemoryChannel(0);
+
+            SetCameraVideoModeAndFrameRate(VideoMode.VideoMode800x600Rgb, FrameRate.FrameRate30);
+            SetProprtyAutomaticSetting(PropertyType.Gain, false);
+            SetProprtyAutomaticSetting(PropertyType.FrameRate, false);
+            SetProprtyAutomaticSetting(PropertyType.Saturation, false);
+            SetProprtyAutomaticSetting(PropertyType.Hue, false);
+            SetProprtyAutomaticSetting(PropertyType.Gamma, false);
+            SetProprtyAutomaticSetting(PropertyType.Shutter, true);
+
+            SetAbsolutePropertyValue(PropertyType.Gain, 0);
+            SetAbsolutePropertyValue(PropertyType.FrameRate, (float)AppSettings.Instance.FrameRate);
+            SetAbsolutePropertyValue(PropertyType.Saturation, (float)AppSettings.Instance.Saturation);
+            SetAbsolutePropertyValue(PropertyType.Gamma, (float)AppSettings.Instance.Gamma);
+
+            SetProprtyEnabledSetting(PropertyType.Hue, true);
+            SetAbsolutePropertyValue(PropertyType.Hue, (float)AppSettings.Instance.Hue);
+        }
+
+        void InitializeSettingsWB()
+        {
+            if ((bool)AppSettings.Instance.WBInitialize)
+            {
+                SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.WhiteBalance, false);
+                SetWhiteBalance((int)AppSettings.Instance.WBInitializeRed, false);
+                SetWhiteBalance((int)AppSettings.Instance.WBInitializeBlue, true);
+            }
+        }
+
+        public override void InitCalibrationSettings()
+        {
+            InitializeSettings();
+        }
+         
+        public override void ResetSettings()
+        {
+            // Hirosh modify
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Shutter, false);
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Shutter, true);
+
+            //Standard Video Mode = 800x600; FrameRate = 30
+            SetCameraVideoModeAndFrameRate(FlyCapture2Managed.VideoMode.VideoMode800x600Rgb, FlyCapture2Managed.FrameRate.FrameRate30);
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Shutter, true);
+            InitializeSettingsWB();
+
+            //Sharpness, Saturation, FrameRate, W.B.(Red) Auto = ON
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Sharpness, true);
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Saturation, true);
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Hue, true);
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.FrameRate, true);
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.WhiteBalance, true);
+
+            //Gamma = 1
+            //SetAbsolutePropertyValue(FlyCapture2Managed.PropertyType.Gamma,
+               // (float)Properties.Settings.Default.Gamma);
+        }
+
+
+        public override void DefaultSettings()
+        {
+            //SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Shutter, true);
+            
+            //Sharpness, Saturation, Gain, FrameRate, W.B.(Red) Auto = OFF
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Sharpness, false);
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Saturation, false);
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Hue, false);
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.FrameRate, false);
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.WhiteBalance, false);
+
+            SetAbsolutePropertyValue(FlyCapture2Managed.PropertyType.Saturation,
+                (float)AppSettings.Instance.Saturation);
+            SetAbsolutePropertyValue(FlyCapture2Managed.PropertyType.Hue,
+                (float)AppSettings.Instance.Hue);
+
+
+            SetAbsolutePropertyValue(FlyCapture2Managed.PropertyType.FrameRate,
+                                                (float)AppSettings.Instance.FrameRate);
+
+            //W.B. (Red) One Push Click
+            //SetProprtyOnePush(FlyCapture2Managed.PropertyType.WhiteBalance, true);
+
+        }
+
+        public override void Calibrate(double R, double G, double B)
+        {
+
+           
+
+            uint oldValue = 0;
+
+            if (R - G > (double)AppSettings.Instance.WBConvergence)
+            {
+                AdjustWhiteBalance(-1, false, ref oldValue);
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Calibration Mode : Decremented WB Red from " + oldValue)));
+                DeviceEvent ee = new DeviceEvent("ColorMeter", new GColorEvent(EventType.Info, "Calibration Mode : Decremented WB Red from " + oldValue, null));
+                UtilsLib.EventBus.Instance.PostEvent(ee);
+            }
+            else if (G - R > (double)AppSettings.Instance.WBConvergence)
+            {
+                AdjustWhiteBalance(1, false, ref oldValue);
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Calibration Mode : Incremented WB Red from " + oldValue)));
+                DeviceEvent ee = new DeviceEvent("ColorMeter", new GColorEvent(EventType.Info, "Calibration Mode : Incremented WB Red from " + oldValue, null));
+                UtilsLib.EventBus.Instance.PostEvent(ee);
+            }
+
+            if (B - G > (double)AppSettings.Instance.WBConvergence)
+            {
+                AdjustWhiteBalance(-1, true, ref oldValue);
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Calibration Mode : Decremented WB Blue from " + oldValue)));
+                DeviceEvent ee = new DeviceEvent("ColorMeter", new GColorEvent(EventType.Info, "Calibration Mode : Decremented WB Blue from " + oldValue, null));
+                UtilsLib.EventBus.Instance.PostEvent(ee);
+            }
+            else if (G - B > (double)AppSettings.Instance.WBConvergence)
+            {
+                AdjustWhiteBalance(1, true, ref oldValue);
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Calibration Mode : Incremented WB Blue from " + oldValue)));
+                DeviceEvent ee = new DeviceEvent("ColorMeter", new GColorEvent(EventType.Info, "Calibration Mode : Incremented WB Blue from " + oldValue, null));
+                UtilsLib.EventBus.Instance.PostEvent(ee);
+            }
+
+            
+            
+        }
+
+        //Hiroshi add for debug
+        public override void Finish_calibration()
+        {
+            SetProprtyAutomaticSetting(FlyCapture2Managed.PropertyType.Shutter, false);
+        }
+        
+        
+
+    }
+}

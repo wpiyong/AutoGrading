@@ -1,0 +1,30 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace AutoGrading.Model
+{
+    public class LogEntry
+    {
+        public LogEntry()
+        {
+        }
+
+        public LogEntry(DateTime d, string m)
+        {
+            DateTime = d;
+            Message = m;
+        }
+
+        public DateTime DateTime { get; set; }
+
+        public string Message { get; set; }
+    }
+
+    class CollapsibleLogEntry : LogEntry
+    {
+        public List<LogEntry> Contents { get; set; }
+    }
+}

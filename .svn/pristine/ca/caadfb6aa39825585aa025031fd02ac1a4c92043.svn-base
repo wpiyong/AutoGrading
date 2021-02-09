@@ -1,0 +1,389 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Text;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+
+namespace gUVLib.Model
+{
+    struct UploadRequest
+    {
+        public string control_number;
+        public string upload_date;
+        public string device_name;
+        public string intensity;
+        public string color;
+        public string user_name;
+        public string l_pl;
+        public string a_pl;
+        public string b_pl;
+        public string c_pl;
+        public string h_pl;
+        public string c_verbal_pl;
+        public string masklength_pl;
+        public string maskarea_pl;
+        public string gain;
+        public string shutter;
+        public string temperature;
+        public string blue_gain;
+        public string red_gain;
+        public string uv_sensor_reading;
+        public string boundary_version;
+        public string comment;
+        public string comment2;
+    }
+
+    public struct Endpoints
+    {
+        public string device_status_url;
+        public string upload_url;
+        public string dissociate_user_url;
+        public string map_user_url;
+    }
+
+    static class GiaSpectrum
+    {
+        struct EndpointsResponse
+        {
+            public Endpoints endpoints;
+            public string message;
+            public string code;
+        }
+
+        struct UserRequest
+        {
+            public string device_name;
+        }
+
+        struct UserResponse
+        {
+            public string code;
+            public string message;
+
+        }
+
+
+        struct UploadResponse
+        {
+            public string code;
+            public string message;
+        }
+
+        static CookieContainer cookie = new CookieContainer();
+
+        static string ConvertToUnsecureString(this SecureString securePassword)
+        {
+            if (securePassword == null)
+                throw new ArgumentNullException("null password");
+
+            IntPtr unmanagedString = IntPtr.Zero;
+            try
+            {
+                unmanagedString = Marshal.SecureStringToGlobalAllocUnicode(securePassword);
+                return Marshal.PtrToStringUni(unmanagedString);
+            }
+            finally
+            {
+                Marshal.ZeroFreeGlobalAllocUnicode(unmanagedString);
+            }
+        }
+
+        public static bool GetEndpoints(out string code, out string message, out Endpoints endpoints)
+        {
+            bool result = false;
+            code = null;
+            message = null;
+            endpoints = new Endpoints();
+
+            try
+            {
+                //string rootUrl = GlobalVariables.spectrumSettings.RootUrl;
+                string rootUrl = AppSettings.Instance.RootUrl;
+
+                HttpWebRequest request = WebRequest.Create(rootUrl) as HttpWebRequest;
+                request.Method = "GET";
+                request.ContentType = "application/json";
+                request.Accept = "application/json";
+                HttpStatusCode httpStatusCode = HttpStatusCode.BadRequest;
+
+
+                // Get response 
+                EndpointsResponse endPointsResponse = new EndpointsResponse
+                {
+                    endpoints = new Endpoints(),
+                    message = null,
+                    code = null
+                };
+
+                using (HttpWebResponse response = request.GetResponse() as HttpWebResponse)
+                {
+                    httpStatusCode = response.StatusCode;
+                    Stream ResponseStream = response.GetResponseStream();
+                    string responseBody = ((new StreamReader(ResponseStream)).ReadToEnd());
+                    endPointsResponse = JsonConvert.DeserializeObject<EndpointsResponse>(responseBody);
+                }
+
+                code = endPointsResponse.code;
+                message = endPointsResponse.message;
+
+                if (httpStatusCode == HttpStatusCode.OK)
+                {
+                    endpoints = endPointsResponse.endpoints;
+                    result = true;
+                }
+                else
+                {
+                    result = false;
+                }
+            }
+            catch (WebException ex)
+            {
+                int statusCode = (int)((HttpWebResponse)ex.Response).StatusCode;
+                Stream responseStream = null;
+                responseStream = ((HttpWebResponse)ex.Response).GetResponseStream();
+                string responseText = (new StreamReader(responseStream)).ReadToEnd();
+                dynamic resp = JsonConvert.DeserializeObject(responseText);
+                message = resp.message;
+                code = resp.code;
+                result = false;
+            }
+            catch (Exception e)
+            {
+                code = null;
+                message = e.Message;
+                result = false;
+            }
+
+            return result;
+        }
+
+        public static bool MapUser(string url, string username, SecureString password, string deviceName, out string code, out string message)
+        {
+            bool result = false;
+            code = null;
+            message = null;
+
+            try
+            {
+                HttpWebRequest request = WebRequest.Create(url) as HttpWebRequest;
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.Accept = "application/json";
+                String encoded = System.Convert.ToBase64String(
+                            System.Text.Encoding.GetEncoding("ISO-8859-1").GetBytes(username + ":" + password.ConvertToUnsecureString()));
+                request.Headers.Add("Authorization", "Basic " + encoded);
+                cookie = new CookieContainer();
+                request.CookieContainer = cookie;
+
+                UserRequest req = new UserRequest();
+                req.device_name = deviceName;
+                string body = JsonConvert.SerializeObject(req);
+                byte[] byteData = UTF8Encoding.UTF8.GetBytes(body);
+                request.ContentLength = byteData.Length;
+
+                using (Stream postStream = request.GetRequestStream())
+                {
+                    postStream.Write(byteData, 0, byteData.Length);
+                }
+
+                // Get response 
+                UserResponse resp = new UserResponse { message = null, code = null };
+                HttpStatusCode httpStatusCode = HttpStatusCode.BadRequest;
+
+                using (HttpWebResponse response = request.GetResponse() as HttpWebResponse)
+                {
+                    httpStatusCode = response.StatusCode;
+                    Stream ResponseStream = response.GetResponseStream();
+                    string responseBody = ((new StreamReader(ResponseStream)).ReadToEnd());
+                    resp = JsonConvert.DeserializeObject<UserResponse>(responseBody);
+                }
+
+                code = resp.code;
+                message = resp.message;
+
+                if (httpStatusCode == HttpStatusCode.Created || httpStatusCode == HttpStatusCode.OK)
+                {
+                    result = true;
+                }
+                else
+                {
+                    result = false;
+                }
+            }
+            catch (WebException ex)
+            {
+                int statusCode = (int)((HttpWebResponse)ex.Response).StatusCode;
+                Stream responseStream = null;
+                responseStream = ((HttpWebResponse)ex.Response).GetResponseStream();
+                string responseText = (new StreamReader(responseStream)).ReadToEnd();
+                dynamic resp = JsonConvert.DeserializeObject(responseText);
+                message = resp.message;
+                code = resp.code;
+                result = false;
+            }
+            catch (Exception e)
+            {
+                code = null;
+                message = e.Message;
+                result = false;
+            }
+
+            return result;
+
+        }
+
+        public static bool Upload(string url, string body, out string code, out string message, out HttpStatusCode httpStatusCode)
+        {
+            bool result = false;
+            code = null;
+            message = null;
+            httpStatusCode = HttpStatusCode.BadRequest; ;
+
+            try
+            {
+                HttpWebRequest request = WebRequest.Create(url) as HttpWebRequest;
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.Accept = "application/json";
+                request.CookieContainer = cookie;
+
+                byte[] byteData = UTF8Encoding.UTF8.GetBytes(body);
+                request.ContentLength = byteData.Length;
+
+                using (Stream postStream = request.GetRequestStream())
+                {
+                    postStream.Write(byteData, 0, byteData.Length);
+                }
+
+                // Get response 
+                UploadResponse upResponse = new UploadResponse { message = null, code = null };
+
+                using (HttpWebResponse response = request.GetResponse() as HttpWebResponse)
+                {
+                    httpStatusCode = response.StatusCode;
+                    Stream ResponseStream = response.GetResponseStream();
+                    string responseBody = ((new StreamReader(ResponseStream)).ReadToEnd());
+                    upResponse = JsonConvert.DeserializeObject<UploadResponse>(responseBody);
+                }
+
+                code = upResponse.code;
+                message = upResponse.message;
+
+                if (httpStatusCode == HttpStatusCode.Created || httpStatusCode == HttpStatusCode.OK)
+                {
+                    result = true;
+                }
+                else
+                {
+                    result = false;
+                }
+            }
+            catch (WebException ex)
+            {
+                httpStatusCode = ((HttpWebResponse)ex.Response).StatusCode;
+                Stream responseStream = null;
+                responseStream = ((HttpWebResponse)ex.Response).GetResponseStream();
+                string responseText = (new StreamReader(responseStream)).ReadToEnd();
+                dynamic resp = JsonConvert.DeserializeObject(responseText);
+                message = resp.message;
+                code = resp.code;
+                result = false;
+            }
+            catch (Exception e)
+            {
+                code = null;
+                message = e.Message;
+                result = false;
+            }
+
+            return result;
+
+        }
+
+
+        public static bool Logout(string url, string deviceName, out string code, out string message)
+        {
+            bool result = false;
+            code = null;
+            message = null;
+
+            try
+            {
+                HttpWebRequest request = WebRequest.Create(url) as HttpWebRequest;
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.Accept = "application/json";
+                request.CookieContainer = cookie;
+
+                UserRequest req = new UserRequest();
+                req.device_name = deviceName;
+                string body = JsonConvert.SerializeObject(req);
+                byte[] byteData = UTF8Encoding.UTF8.GetBytes(body);
+                request.ContentLength = byteData.Length;
+
+                using (Stream postStream = request.GetRequestStream())
+                {
+                    postStream.Write(byteData, 0, byteData.Length);
+                }
+
+                // Get response 
+                UserResponse resp = new UserResponse { message = null, code = null };
+                HttpStatusCode httpStatusCode = HttpStatusCode.BadRequest;
+
+                using (HttpWebResponse response = request.GetResponse() as HttpWebResponse)
+                {
+                    httpStatusCode = response.StatusCode;
+                    Stream ResponseStream = response.GetResponseStream();
+                    string responseBody = ((new StreamReader(ResponseStream)).ReadToEnd());
+                    resp = JsonConvert.DeserializeObject<UserResponse>(responseBody);
+                }
+
+                code = resp.code;
+                message = resp.message;
+
+                if (httpStatusCode == HttpStatusCode.OK || httpStatusCode == HttpStatusCode.Unauthorized)
+                {
+                    result = true;
+
+                    var cookies = cookie.GetCookies(new Uri(url));
+                    foreach (Cookie co in cookies)
+                    {
+                        co.Expires = DateTime.Now.Subtract(TimeSpan.FromDays(1));
+                    }
+                }
+                else
+                {
+                    result = false;
+                }
+            }
+            catch (WebException ex)
+            {
+                var statusCode = ((HttpWebResponse)ex.Response).StatusCode;
+                Stream responseStream = null;
+                responseStream = ((HttpWebResponse)ex.Response).GetResponseStream();
+                string responseText = (new StreamReader(responseStream)).ReadToEnd();
+                dynamic resp = JsonConvert.DeserializeObject(responseText);
+                message = resp.message;
+                code = resp.code;
+                if (statusCode != HttpStatusCode.Unauthorized)//already logged out
+                    result = false;
+                else
+                    result = true;
+            }
+            catch (Exception e)
+            {
+                code = null;
+                message = e.Message;
+                result = false;
+            }
+
+            return result;
+
+        }
+    }
+}

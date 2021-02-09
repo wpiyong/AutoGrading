@@ -1,0 +1,102 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+
+namespace AutoGrading.Model
+{
+    public class AutoGradingSettings
+    {
+        protected XDocument _settings;
+        protected string settingsFileName = "";
+
+        public bool SaveMeasurements { get; set; }
+        public string HostIPAddress { get; set; }
+        public string URHostIPAddress { get; set; }
+        public int HostPort { get; set; }
+        public int URHostPort { get; set; }
+        public string DeviceList { get; set; }
+
+        public string[] Devices
+        {
+            get { return DeviceList.Split(','); }
+        }
+        public AutoGradingSettings()
+        {
+            string currentDirectory = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
+
+            settingsFileName = currentDirectory + @"\AutoGradingSettings.config";
+        }
+
+        public bool Load()
+        {
+            bool result = false;
+            try
+            {
+                _settings = XDocument.Load(settingsFileName);
+                foreach (var prop in this.GetType().GetProperties())
+                {
+                    if (prop.PropertyType.Name.Contains("[]"))
+                    {
+                        continue;
+                    }
+                    prop.SetValue(this, Convert.ChangeType(Get(prop.Name), prop.PropertyType,
+                        System.Globalization.CultureInfo.InvariantCulture));
+
+                }
+
+                result = true;
+            }
+            catch
+            {
+                result = false;
+            }
+
+            return result;
+        }
+
+        protected object Get(string name)
+        {
+            object res = null;
+
+            var field = _settings.Descendants("setting")
+                                    .Where(x => (string)x.Attribute("name") == name)
+                                    .FirstOrDefault();
+
+            if (field != null)
+            {
+                res = field.Element("value").Value;
+            }
+            else
+                throw new Exception("Property not found in Settings");
+
+            return res;
+        }
+
+        protected void Set(string name, object value)
+        {
+            var field = _settings.Descendants("setting")
+                                    .Where(x => (string)x.Attribute("name") == name)
+                                    .FirstOrDefault();
+
+            if (field != null)
+            {
+                field.Element("value").Value = value.ToString();
+            }
+            else
+                throw new Exception("Property not found in Settings");
+        }
+
+        public void Save()
+        {
+            foreach (var prop in this.GetType().GetProperties())
+            {
+                Set(prop.Name, prop.GetValue(this));
+            }
+            _settings.Save(settingsFileName);
+
+        }
+    }
+}

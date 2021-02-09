@@ -1,0 +1,246 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Windows.Media.Imaging;
+using System.Text;
+using System.Threading.Tasks;
+using System.Net.Sockets;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.ComponentModel;
+
+namespace UtilsLib
+{
+    public class Result
+    {
+        public bool success;
+        public string message;
+        public object value;
+
+        public Result(bool success, string message, object value)
+        {
+            this.success = success;
+            this.message = message;
+            this.value = value;
+        }
+    }
+
+    public enum Status
+    {
+        Ready = 0,
+        Busy,
+        DisConnected
+    }
+
+    public enum EventType
+    {
+        Info,
+        Error,
+        Status,
+        Result
+    }
+
+    public class ImageReceived
+    {
+        public string device;
+        public BitmapSource image;
+        public ImageReceived(string device, BitmapSource image)
+        {
+            this.device = device;
+            this.image = image;
+        }
+    }
+
+    public class DeviceStatus
+    {
+        public Status status;
+        public string procID;
+        public DeviceStatus(Status status)
+        {
+            this.status = status;
+        }
+    }
+
+    public class DeviceEvent
+    {
+        public string device;
+        public object result;
+
+        public DeviceEvent(string d, object r)
+        {
+            device = d;
+            result = r;
+        }
+    }
+
+    public class GColorEvent
+    {
+        public EventType eventType;
+        public string message;
+        public object result;
+
+        public GColorEvent(EventType e, string m, object r)
+        {
+            eventType = e;
+            message = m;
+            result = r;
+        }
+    }
+
+    public class GUVEvent
+    {
+        public EventType eventType;
+        public string message;
+        public object result;
+
+        public GUVEvent(EventType e, string m, object r)
+        {
+            eventType = e;
+            message = m;
+            result = r;
+        }
+    }
+
+    public class DPLEvent
+    {
+        public EventType eventType;
+        public string message;
+        public object result;
+
+        public DPLEvent(EventType e, string m, object r)
+        {
+            eventType = e;
+            message = m;
+            result = r;
+        }
+    }
+
+    public class URobotResult
+    {
+        public string Command;
+        public TcpClient Client;
+        public URobotResult(string com, TcpClient client)
+        {
+            Command = com;
+            Client = client;
+        }
+    }
+
+    public class URobotEvent
+    {
+        public EventType eventType;
+        public string message;
+        public object result;
+        public string id;
+
+        public URobotEvent(EventType e, string m, object r)
+        {
+            eventType = e;
+            message = m;
+            result = r;
+        }
+        public URobotEvent(EventType e, string m, object r, string id)
+        {
+            eventType = e;
+            message = m;
+            result = r;
+            this.id = id;
+        }
+    }
+
+    public class EventBus
+    {
+        public static EventBus Instance { get { return instance ?? (instance = new EventBus()); } }
+
+        public void Register(object listener)
+        {
+            if (!listeners.Any(l => l.Listener == listener))
+                listeners.Add(new EventListenerWrapper(listener));
+        }
+
+        public void Unregister(object listener)
+        {
+            listeners.RemoveAll(l => l.Listener == listener);
+        }
+
+        public void PostEvent(object e)
+        {
+            listeners.Where(l => l.EventType == e.GetType()).ToList().ForEach(l => l.PostEvent(e));
+        }
+
+        private static EventBus instance;
+
+        private EventBus() { }
+
+        private List<EventListenerWrapper> listeners = new List<EventListenerWrapper>();
+
+        private class EventListenerWrapper
+        {
+            public object Listener { get; private set; }
+            public Type EventType { get; private set; }
+
+            private MethodBase method;
+
+            public EventListenerWrapper(object listener)
+            {
+                Listener = listener;
+
+                Type type = listener.GetType();
+
+                method = type.GetMethod("OnEvent");
+                if (method == null)
+                    throw new ArgumentException("Class " + type.Name + " does not containt method OnEvent");
+
+                ParameterInfo[] parameters = method.GetParameters();
+                if (parameters.Length != 1)
+                    throw new ArgumentException("Method OnEvent of class " + type.Name + " have invalid number of parameters (should be one)");
+
+                EventType = parameters[0].ParameterType;
+            }
+
+            public void PostEvent(object e)
+            {
+                method.Invoke(Listener, new[] { e });
+            }
+        }
+    }
+
+    public class DeviceManager : INotifyPropertyChanged
+    {
+        public string DeviceName { get; set; }
+        public object device = null;
+        public object deviceClient = null;
+        Status _status;
+
+        public event PropertyChangedEventHandler PropertyChanged;
+        private void OnPropertyChanged(string propertyname)
+        {
+            if (PropertyChanged != null)
+            {
+                PropertyChanged(this, new PropertyChangedEventArgs(propertyname));
+            }
+        }
+
+        public Status status
+        {
+            get { return _status; }
+            set
+            {
+                _status = value;
+                OnPropertyChanged("status");
+            }
+        }
+        public DeviceManager(string name) { DeviceName = name; status = Status.DisConnected; }
+        public virtual bool InitialStone( string ctlNum ) { return false; }
+        public virtual bool ConnectEx() { return false; }
+        public virtual bool ReconnectEx() { return false; }
+        public virtual bool CalibrateEx() { return false; }
+        public virtual bool MeasureEx() { return false; }
+        public virtual bool DisconnectEx() { return false; }
+        public virtual bool IsDeviceReady() { return false; }
+        public virtual bool Send(string msg, bool client = false) { return false; }
+        public virtual bool NeedCalibration() { return false; }
+    }
+}
+  

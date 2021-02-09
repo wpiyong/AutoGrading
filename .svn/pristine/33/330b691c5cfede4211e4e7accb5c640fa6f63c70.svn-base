@@ -1,0 +1,670 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.IO.Ports;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using System.Timers;
+using System.Windows;
+using UtilsLib;
+
+namespace FTIRLib.Model
+{
+    public static class Drift
+    {
+        static bool _motorConnected = false;
+#if (ETHERNET)
+        static UdpClient _udpClient = null;
+#else
+        static SerialPort _serialPort = null;
+#endif
+        static Timer _inputStatusPollTimer, _motorConnectTimer;
+        static Object _statusLock = new Object();
+        static byte _errorCount = 0;
+        static List<string> _openMotorCommands = new List<string>();
+        static List<string> _closeMotorCommands = new List<string>();
+
+        static object _commandActive = new object();
+
+        static System.Threading.Thread PollThread = null;
+        static bool PollThreadRunning = true;
+        static bool PollThreadPause = false;
+        static System.Threading.ManualResetEvent PollThreadManualResetEvent = null;
+
+        public static bool CommandActive { get; private set; }
+
+        static Drift()
+        {
+            CommandActive = false;
+
+            if (LoadHemisphereMotorProfile())
+            {
+                _motorConnectTimer = new Timer();
+                _motorConnectTimer.Interval = 200;
+                _motorConnectTimer.AutoReset = false;
+                _motorConnectTimer.Elapsed += new ElapsedEventHandler(_motorConnectTimer_Elapsed);
+                _motorConnectTimer.Start();
+            }
+
+            PollThreadManualResetEvent = new System.Threading.ManualResetEvent(false);
+            PollThread = StartPollThread();
+        }
+
+        static bool LoadHemisphereMotorProfile()
+        {
+            bool result = false;
+            try
+            {
+                _openMotorCommands = new List<string>();
+                _closeMotorCommands = new List<string>();
+                int state = 0;
+
+                using (var reader = new StreamReader("FTIRDriftMotorProfile.txt"))
+                {
+                    while (!reader.EndOfStream)
+                    {
+                        string line = reader.ReadLine();
+                        if (line.ToUpper() == "OPENPROFILE")
+                            state = 1;
+                        else if (line.ToUpper() == "CLOSEPROFILE")
+                            state = 2;
+                        else if (line.Trim().Length > 0)
+                        {
+                            switch (state)
+                            {
+                                case 1:
+                                    _openMotorCommands.Add(line);
+                                    break;
+                                case 2:
+                                    _closeMotorCommands.Add(line);
+                                    break;
+                            }
+                        }
+                    }
+                }
+
+
+                if (_openMotorCommands.Count == 0 || _closeMotorCommands.Count == 0)
+                {
+                    throw new Exception("Bad HemisphereMotorProfile.txt format");
+                }
+
+                result = true;
+            }
+            catch (Exception ex)
+            {
+                //App.LogEntry.AddEntry(ex.Message, true);
+                DeviceEvent e = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, ex.Message, null));
+                UtilsLib.EventBus.Instance.PostEvent(e);
+                result = false;
+            }
+
+            return result;
+        }
+
+
+        public static void Open(Object sender, DoWorkEventArgs e)
+        {
+            if (!_motorConnected) return;
+            if (IsOpen) return;
+
+            if (e != null) e.Result = false;
+
+            PollThreadManualResetEvent.Reset();
+            PollThreadPause = true;
+            System.Threading.Thread.Sleep(200);
+
+            if (System.Threading.Monitor.TryEnter(_commandActive, 12000))
+            {
+                try
+                {
+                    CommandActive = true;
+                    foreach (var command in _openMotorCommands)
+                    {
+#if (ETHERNET)
+                        WriteLine(command);
+                        System.Threading.Thread.Sleep(100);
+                        //CheckAck();
+#else
+                        _serialPort.WriteLine(command);
+#endif
+                    }
+                }
+                catch (Exception ex)
+                {
+                    //App.LogEntry.AddEntry(ex.Message, true);
+                    DeviceEvent ee = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, ex.Message, null));
+                    UtilsLib.EventBus.Instance.PostEvent(ee);
+                    //throw;
+                }
+                finally
+                {
+                    System.Threading.Monitor.Exit(_commandActive);
+                    CommandActive = false;
+                }
+
+                System.Threading.Thread.Sleep(2000);
+
+                PollThreadPause = false;
+                PollThreadManualResetEvent.Set();
+
+                for (int i = 0; i < 400; i++)
+                {
+                    if (!IsOpen)
+                        System.Threading.Thread.Sleep(100);
+                    else
+                        break;
+                }
+                if (e != null) e.Result = IsOpen;
+            }
+        }
+
+        public static void Close(Object sender, DoWorkEventArgs e)
+        {
+            if (!_motorConnected) return;
+            if (IsClosed)
+            {
+                if (e != null)
+                    e.Result = true;
+                return;
+            }
+            if (e != null) e.Result = false;
+
+            PollThreadManualResetEvent.Reset();
+            PollThreadPause = true;
+            System.Threading.Thread.Sleep(200);
+
+            if (System.Threading.Monitor.TryEnter(_commandActive, 12000))
+            {
+                try
+                {
+                    CommandActive = true;
+                    foreach (var command in _closeMotorCommands)
+                    {
+#if (ETHERNET)
+                        WriteLine(command);
+                        System.Threading.Thread.Sleep(50);
+                        //CheckAck();
+#else
+                        _serialPort.WriteLine(command);
+#endif
+                    }
+                }
+                catch (Exception ex)
+                {
+                    //App.LogEntry.AddEntry(ex.Message, true);
+                    DeviceEvent ee = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, ex.Message, null));
+                    UtilsLib.EventBus.Instance.PostEvent(ee);
+                    //throw;
+                }
+                finally
+                {
+                    System.Threading.Monitor.Exit(_commandActive);
+                    CommandActive = false;
+                }
+
+                System.Threading.Thread.Sleep(2000);
+
+                PollThreadPause = false;
+                PollThreadManualResetEvent.Set();
+
+                for (int i = 0; i < 400; i++)
+                {
+                    if (!IsClosed)
+                    {
+                        //System.Threading.Thread.Sleep(100);
+                        System.Threading.Thread.Sleep(4000);
+                        IsClosed = true;
+                        break;
+                    }
+                    else
+                        break;
+                }
+                if (e != null) e.Result = IsClosed;
+            }
+        }
+
+#if(ETHERNET)
+        static void WriteLine(string s)
+        {
+            if (_udpClient != null)
+            {
+                Byte[] SCLstring = Encoding.ASCII.GetBytes(s);
+                // create a byte array that will be used for the actual
+                // transmission
+                Byte[] sendBytes = new Byte[SCLstring.Length + 3];
+                // insert opcode (07 is used for all SCL commands)
+                sendBytes[0] = 0;
+                sendBytes[1] = 7;
+                // copy string to the byte array
+                System.Array.Copy(SCLstring, 0, sendBytes, 2, SCLstring.Length);
+                // insert terminator
+                sendBytes[sendBytes.Length - 1] = 13; // CR
+                                                      // send it to the drive
+                _udpClient.Send(sendBytes, sendBytes.Length);
+            }
+        }
+
+        static string ReadLine()
+        {
+            string s = "";
+            if (_udpClient != null)
+            {
+                int count = 0;
+                while (count < 5)
+                {
+                    if (_udpClient.Available > 0) // is there a packet ready?
+                    {
+                        count = 5;
+                        // listen to specific host
+                        IPEndPoint RemoteIpEndPoint = new IPEndPoint(IPAddress.Parse(AppSettings.Instance.HemisphereIPAddress), AppSettings.Instance.HemispherePort);
+                        try
+                        {
+                            // Get the received packet. Receive method blocks
+                            // until a message returns on this socket from a remote host,
+                            // so always check .Available to see if a packet is ready.
+                            Byte[] receiveBytes = _udpClient.Receive(ref RemoteIpEndPoint);
+                            // strip opcode
+                            Byte[] SCLstringRec = new byte[receiveBytes.Length - 2];
+                            for (int m = 0; m < SCLstringRec.Length; m++)
+                                SCLstringRec[m] = receiveBytes[m + 2];
+                            s = Encoding.ASCII.GetString(SCLstringRec);
+                        }
+                        catch (Exception ex)
+                        {
+                            DeviceEvent e = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, ex.Message, null));
+                            EventBus.Instance.PostEvent(e);
+                            s = "";
+                        }
+                    } else
+                    {
+                        count++;
+                        System.Threading.Thread.Sleep(100);
+                    }
+                }
+            }
+            return s;
+        }
+
+        static void CheckAck()
+        {
+            var response = ReadLine();
+            if (!response.Equals("%\r") && !response.Equals("*\r"))
+            {
+                throw new ApplicationException("The command was not acknowledged - please try again momentarily." + response);
+            }
+        }
+
+        static void _motorConnectTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            bool _hemiMotorFound = false;
+
+            _udpClient = new UdpClient(7780);
+            _udpClient.Client.ReceiveBufferSize = 50;
+            DeviceEvent de = new DeviceEvent("FTIR", new FTIREvent(EventType.Info, "Trying to connect to Stepper Motor", null));
+            EventBus.Instance.PostEvent(de);
+
+            try
+            {
+                _udpClient.Connect(AppSettings.Instance.HemisphereIPAddress, AppSettings.Instance.HemispherePort);
+
+                WriteLine("PM");
+                System.Threading.Thread.Sleep(1000);
+                if (_udpClient.Available > 0) // is there a packet ready?
+                {
+                    string returnData = ReadLine();
+                    if (returnData != "" && returnData.Substring(3, 1) == "2")
+                    {
+                        _hemiMotorFound = true;
+
+                        WriteLine("OP");
+                        System.Threading.Thread.Sleep(1000);
+                        de = new DeviceEvent("FTIR", new FTIREvent(EventType.Info, "Hemisphere Option Board: " + ReadLine(), null));
+                        EventBus.Instance.PostEvent(de);
+
+                        WriteLine("SC");
+                        System.Threading.Thread.Sleep(1000);
+                        string response = ReadLine().Substring(3);
+                        de = new DeviceEvent("FTIR", new FTIREvent(EventType.Info, "Hemisphere Status: 0x" + response, null));
+                        EventBus.Instance.PostEvent(de);
+                    }
+                    else
+                    {
+                        WriteLine("PM2");
+                        System.Threading.Thread.Sleep(1000);
+                        CheckAck();
+                        //App.LogEntry.AddEntry("ST5 : Please power cycle the Motor Drive and try connecting again", true);
+                        DeviceEvent ee = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, "Hemisphere : Please power cycle the Motor Drive and try connecting again", null));
+                        UtilsLib.EventBus.Instance.PostEvent(ee);
+                        return;
+                    }
+                }
+
+            }
+            catch (Exception ex)
+            {
+                _hemiMotorFound = false;
+                de = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(de);
+            }
+
+            if (!_hemiMotorFound)
+            {
+                if (_udpClient != null)
+                    _udpClient.Close();
+                _motorConnectTimer.Start();
+                return;
+            }
+
+            _motorConnected = true;
+            //Application.Current.Dispatcher.BeginInvoke(new Action(System.Windows.Input.CommandManager.InvalidateRequerySuggested));
+
+            string status = "";
+            WriteLine("IS");
+            System.Threading.Thread.Sleep(1000);
+            status = ReadLine();
+            var hState = 0;
+            if (status.Length == 12)
+            {
+                status = status.Substring(3);
+                hState = (Convert.ToByte(status.Substring(5, 3), 2));
+            }
+
+            _isOpen = (hState & 0x5) == 0x5;
+            _isClosed = (hState & 0x6) == 0x6;
+
+            //_inputStatusPollTimer = new Timer();
+            //_inputStatusPollTimer.Interval = 200;
+            //_inputStatusPollTimer.AutoReset = false;
+            //_inputStatusPollTimer.Elapsed += new ElapsedEventHandler(_inputStatusPollTimer_Elapsed);
+            //_inputStatusPollTimer.Start();
+
+            PollThread.Start();
+
+            //close on connect
+            Close(null, null);
+        }
+#else
+        static void _motorConnectTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            string[] ports = SerialPort.GetPortNames();
+            bool _hemiMotorFound = false;
+
+            foreach (string port in ports)
+            {
+                try
+                {
+                    if (_serialPort != null)
+                        _serialPort.Close();
+
+                    _serialPort = new SerialPort(port, 19200, Parity.None, 8, StopBits.One);
+                    _serialPort.DtrEnable = true;
+                    _serialPort.NewLine = "\r";
+                    _serialPort.Encoding = System.Text.Encoding.ASCII;
+                    _serialPort.ReadTimeout = 2000;
+                    _serialPort.WriteTimeout = 2000;
+
+                    if (!_serialPort.IsOpen)
+                        _serialPort.Open();
+
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.DiscardOutBuffer();
+
+                    //write some nulls
+                    _serialPort.Write("\0");
+                    _serialPort.Write("\0");
+                    _serialPort.Write("\0");
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.DiscardOutBuffer();
+
+                    _serialPort.WriteLine("MV");
+                    string mvRead = _serialPort.ReadLine();
+                    try
+                    {
+                        _model = (SERVO_MOTOR_MODEL)Convert.ToInt32(mvRead.Substring(4, 3)); ;
+                    }
+                    catch
+                    {
+                        //Application.Current.Dispatcher.Invoke((Action)(() =>
+                        //    App.LogEntry.AddEntry("Unsupported Hemisphere Motor Drive", true)));
+                        DeviceEvent er = new DeviceEvent("FTIR", new FTIREvent(EventType.Error, "Unsupported Hemisphere Motor Drive", null));
+                        UtilsLib.EventBus.Instance.PostEvent(er);
+                    }
+
+                    //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Hemisphere  Model/Revision: " + mvRead)));
+                    DeviceEvent ee = new DeviceEvent("FTIR", new FTIREvent(EventType.Info, "Hemisphere  Model/Revision: " + mvRead, null));
+                    UtilsLib.EventBus.Instance.PostEvent(ee);
+
+                    _serialPort.WriteLine("OP");
+                    //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Hemisphere Option Board: " + _serialPort.ReadLine())));
+                    ee = new DeviceEvent("FTIR", new FTIREvent(EventType.Info, "Hemisphere Option Board: " + _serialPort.ReadLine(), null));
+                    UtilsLib.EventBus.Instance.PostEvent(ee);
+
+                    _serialPort.WriteLine("SC");
+                    string response = _serialPort.ReadLine().Substring(3);
+                    //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Hemisphere Status: 0x" + response)));
+                    ee = new DeviceEvent("FTIR", new FTIREvent(EventType.Info, "Hemisphere Status: 0x" + response, null));
+                    UtilsLib.EventBus.Instance.PostEvent(ee);
+
+                    _serialPort.WriteLine("BR");
+                    response = _serialPort.ReadLine().Substring(3);
+
+                    if (response == "2")
+                    {
+                        _hemiMotorFound = true;
+                        break;
+                    }
+                }
+                catch
+                {
+                    if (_serialPort != null)
+                        _serialPort.Close();
+                }
+
+            }
+
+            if (!_hemiMotorFound)
+            {
+                if (_serialPort != null)
+                    _serialPort.Close();
+                _motorConnectTimer.Start();
+                return;
+            }
+
+            _motorConnected = true;
+            FTIREvent geb = new FTIREvent(EventType.Info, "Hemisphere motor connected", null);
+            DeviceEvent det = new DeviceEvent("FTIR", geb);
+            EventBus.Instance.PostEvent(det);
+
+            string status = "";
+            _serialPort.DiscardInBuffer();
+            _serialPort.WriteLine("IS");
+            status = _serialPort.ReadLine();
+            var hState = 0;
+            if (status.Length == 11)
+            {
+                status = status.Substring(3);
+                hState = (Convert.ToByte(status.Substring(5, 3), 2));
+            }
+
+            _isOpen = (hState & 0x5) == 0x5;
+            _isClosed = (hState & 0x6) == 0x6;
+
+            _inputStatusPollTimer = new Timer();
+            _inputStatusPollTimer.Interval = 200;
+            _inputStatusPollTimer.AutoReset = false;
+            _inputStatusPollTimer.Elapsed += new ElapsedEventHandler(_inputStatusPollTimer_Elapsed);
+            _inputStatusPollTimer.Start();
+
+            //close on connect
+            Close(null, null);
+        }
+#endif
+
+        public static bool HemisphereMotorConnected
+        {
+            get { return _motorConnected; }
+        }
+
+        static volatile bool _isOpen, _isClosed;
+        public static bool IsOpen
+        {
+            get
+            {
+                return _isOpen;
+            }
+            set
+            {
+                _isOpen = value;
+            }
+        }
+
+        public static bool IsClosed
+        {
+            get
+            {
+                return _isClosed;
+            }
+            set
+            {
+                _isClosed = value;
+            }
+        }
+
+
+        static void _inputStatusPollTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            try
+            {
+                string response = "";
+                lock (_statusLock)
+                {
+#if (ETHERNET)
+                    WriteLine("IS");
+                    System.Threading.Thread.Sleep(100);
+                    response = ReadLine();
+#else
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.WriteLine("IS");
+                    response = _serialPort.ReadLine();
+#endif
+                }
+
+                byte hState = 0;
+#if (ETHERNET)
+                if (response.Length == 12)
+                {
+                    response = response.Substring(3);
+                    hState = (Convert.ToByte(response.Substring(6, 2), 2));
+                }
+#else
+                if (response.Length == 11)
+                {
+                    response = response.Substring(3);
+                    hState = (Convert.ToByte(response.Substring(6, 2), 2));
+                }
+#endif
+                IsOpen = (hState & 0x1) == 0x1;
+                IsClosed = (hState & 0x2) == 0x2;
+
+                _inputStatusPollTimer.Start();
+                _errorCount = 0;
+            }
+            catch
+            {
+                if (_errorCount++ > 10) // 10 consecutive errors
+                {
+                    _errorCount = 0;
+                    _motorConnected = false;
+                    //_motorConnectTimer.Start();
+                }
+                else
+                    _inputStatusPollTimer.Start();
+            }
+
+
+        }
+
+        static void PollThreadEx()
+        {
+            while (PollThreadRunning)
+            {
+                try
+                {
+                    string response = "";
+                    lock (_statusLock)
+                    {
+#if (ETHERNET)
+                        WriteLine("IS");
+                        System.Threading.Thread.Sleep(100);
+                        response = ReadLine();
+#else
+                        _serialPort.DiscardInBuffer();
+                        _serialPort.WriteLine("IS");
+                        response = _serialPort.ReadLine();
+#endif
+                    }
+
+                    byte hState = 0;
+#if (ETHERNET)
+                    if (response.Length == 12)
+                    {
+                        response = response.Substring(3);
+                        hState = (Convert.ToByte(response.Substring(6, 2), 2));
+
+                        IsOpen = (hState & 0x1) == 0x1;
+                        IsClosed = (hState & 0x2) == 0x2;
+
+                        _errorCount = 0;
+                    }
+#else
+                    if (response.Length == 11)
+                    {
+                        response = response.Substring(3);
+                        hState = (Convert.ToByte(response.Substring(6, 2), 2));
+
+                        IsOpen = (hState & 0x1) == 0x1;
+                        IsClosed = (hState & 0x2) == 0x2;
+
+                        _errorCount = 0;
+                    }
+#endif
+
+                }
+                catch
+                {
+                    if (_errorCount++ > 10) // 10 consecutive errors
+                    {
+                        _errorCount = 0;
+                        _motorConnected = false;
+                        //_motorConnectTimer.Start();
+                    }
+                }
+
+                if (PollThreadPause)
+                {
+                    PollThreadManualResetEvent.WaitOne();
+                }
+
+                System.Threading.Thread.Sleep(200);
+            }
+        }
+
+        static System.Threading.Thread StartPollThread()
+        {
+            System.Threading.Thread t = new System.Threading.Thread(PollThreadEx);
+            return t;
+        }
+
+        public static void Disconnect()
+        {
+            PollThreadRunning = false;
+            PollThreadManualResetEvent.Set();
+            _udpClient.Close();
+        }
+    }
+}

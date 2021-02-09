@@ -1,0 +1,6 @@
+C:\work\AutoGrading\AutoGrading\UtilsLib\bin\x64\Debug\UtilsLib.dll
+C:\work\AutoGrading\AutoGrading\UtilsLib\bin\x64\Debug\UtilsLib.pdb
+C:\work\AutoGrading\AutoGrading\UtilsLib\obj\x64\Debug\UtilsLib.csproj.CoreCompileInputs.cache
+C:\work\AutoGrading\AutoGrading\UtilsLib\obj\x64\Debug\UtilsLib.dll
+C:\work\AutoGrading\AutoGrading\UtilsLib\obj\x64\Debug\UtilsLib.pdb
+C:\work\AutoGrading\AutoGrading\UtilsLib\obj\x64\Debug\UtilsLib.csprojAssemblyReference.cache

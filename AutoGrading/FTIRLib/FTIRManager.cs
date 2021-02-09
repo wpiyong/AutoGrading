@@ -1,0 +1,347 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using DiamondCheck_Auto;
+using OmTalk;
+using UtilsLib;
+using FTIRLib.Model;
+using System.ComponentModel;
+using System.Threading;
+
+namespace FTIRLib
+{
+    public class FTIRManager : DeviceManager
+    {
+        PrimaryFTIR _diamondCheck = null;
+
+        public FTIRManager(string name, bool connecting) : base(name)
+        {
+            _diamondCheck = new PrimaryFTIR();
+
+            if (connecting)
+            {
+                ConnectToDriftEx();
+            }
+        }
+
+        ~FTIRManager()
+        {
+            DriftClose();
+            int timeout = 60 * 1000;
+            int elapsed = 0;
+            while (!Drift.IsClosed && elapsed < timeout)
+            {
+                Thread.Sleep(500);
+                elapsed += 500;
+            }
+
+            Drift.Disconnect();
+            GC.SuppressFinalize(this);
+        }
+
+        #region Properties
+        string _controlNumber = "0";
+        public string ControlNumber
+        {
+            get { return _controlNumber; }
+            set
+            {
+                _controlNumber = value;
+            }
+        }
+
+        bool _calibrated = false;
+        public bool Calibrated
+        {
+            get { return _calibrated; }
+            set
+            {
+                if(_calibrated == value)
+                {
+                    return;
+                }
+                _calibrated = value;
+            }
+        }
+
+        bool _connected = false;
+        public bool Connected
+        {
+            get { return _connected; }
+            set
+            {
+                if(_connected == value)
+                {
+                    return;
+                }
+                _connected = value;
+                if (_connected)
+                {
+                    status = UtilsLib.Status.Ready;
+                } else
+                {
+                    status = UtilsLib.Status.DisConnected;
+                }
+            }
+        }
+        #endregion
+
+        void ConnectToDriftEx()
+        {
+            BackgroundWorker bwConnectHemisphere = new BackgroundWorker();
+            bwConnectHemisphere.DoWork += new DoWorkEventHandler(ConnectToDrifts);
+            bwConnectHemisphere.RunWorkerCompleted += new RunWorkerCompletedEventHandler(ConnectToDriftsCompleted);
+            bwConnectHemisphere.RunWorkerAsync();
+        }
+
+        void ConnectToDrifts(object sender, DoWorkEventArgs e)
+        {
+            if (!Drift.HemisphereMotorConnected)
+            {
+                e.Result = false;
+            }
+            else
+            {
+                e.Result = true;
+            }
+        }
+
+        void ConnectToDriftsCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            bool res = (bool)e.Result;
+            if (res)
+            {
+                FTIREvent geb = new FTIREvent(EventType.Info, "Hemisphere motor connected", null);
+                DeviceEvent det = new DeviceEvent(DeviceName, geb);
+                EventBus.Instance.PostEvent(det);
+
+                Connected = true;
+
+                status = UtilsLib.Status.Ready;
+            } else
+            {
+                FTIREvent geb = new FTIREvent(EventType.Info, "Initial hemisphere motor", null);
+                DeviceEvent det = new DeviceEvent(DeviceName, geb);
+                EventBus.Instance.PostEvent(det);
+                Connected = false;
+
+                ConnectToDriftEx();
+            }
+        }
+
+        void DriftOpen()
+        {
+            BackgroundWorker bw = new BackgroundWorker();
+            bw.DoWork += new DoWorkEventHandler(Drift.Open);
+            bw.RunWorkerAsync();
+        }
+
+        void DriftClose()
+        {
+            BackgroundWorker bw = new BackgroundWorker();
+            bw.DoWork += new DoWorkEventHandler(Drift.Close);
+            bw.RunWorkerAsync();
+        }
+
+        void DoCalibration(object sender, DoWorkEventArgs e)
+        {
+            DriftClose();
+
+            int timeout = 60 * 1000;
+            int elapsed = 0;
+            while (!Drift.IsClosed && elapsed < timeout)
+            {
+                Thread.Sleep(500);
+                elapsed += 500;
+            }
+
+            if (!Drift.IsClosed)
+            {
+                FTIREvent ev = new FTIREvent(EventType.Error, "Drift close failed", null);
+                DeviceEvent d = new DeviceEvent(DeviceName, ev);
+                EventBus.Instance.PostEvent(d);
+
+                e.Result = 9999;
+                return;
+            }
+
+            FTIREvent evb = new FTIREvent(EventType.Status, "Calibrating...", null);
+            DeviceEvent de = new DeviceEvent(DeviceName, evb);
+            EventBus.Instance.PostEvent(de);
+            try
+            {
+                e.Result = _diamondCheck.FTIR_Start();
+            } catch(Exception ex)
+            {
+                e.Result = 9999;
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+        void DoCalibrationCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            int res = (int)e.Result;
+            if(res == 0)
+            {
+                Calibrated = true;
+                FTIREvent evb = new FTIREvent(EventType.Info, "Calibration Completed", null);
+                DeviceEvent de = new DeviceEvent(DeviceName, evb);
+                EventBus.Instance.PostEvent(de);
+            } else
+            {
+                Calibrated = false;
+                FTIREvent evb = new FTIREvent(EventType.Error, "Calibration failed", null);
+                DeviceEvent de = new DeviceEvent(DeviceName, evb);
+                EventBus.Instance.PostEvent(de);
+            }
+
+            DriftOpen();
+
+            int timeout = 60 * 1000;
+            int elapsed = 0;
+            while (!Drift.IsOpen && elapsed < timeout)
+            {
+                Thread.Sleep(500);
+                elapsed += 500;
+            }
+
+            if (!Drift.IsOpen)
+            {
+                FTIREvent ev = new FTIREvent(EventType.Error, "Drift open failed", null);
+                DeviceEvent d = new DeviceEvent(DeviceName, ev);
+                EventBus.Instance.PostEvent(d);
+            }
+        }
+
+        void DoMeasurement(object sender, DoWorkEventArgs e)
+        {
+            DriftClose();
+
+            int timeout = 60 * 1000;
+            int elapsed = 0;
+            while (!Drift.IsClosed && elapsed < timeout)
+            {
+                Thread.Sleep(500);
+                elapsed += 500;
+            }
+
+            if (!Drift.IsClosed)
+            {
+                FTIREvent ev = new FTIREvent(EventType.Error, "Drift close failed", null);
+                DeviceEvent d = new DeviceEvent(DeviceName, ev);
+                EventBus.Instance.PostEvent(d);
+
+                e.Result = 9999;
+                return;
+            }
+
+            FTIREvent evb = new FTIREvent(EventType.Status, "Measuring...", null);
+            DeviceEvent de = new DeviceEvent(DeviceName, evb);
+            EventBus.Instance.PostEvent(de);
+            try
+            {
+                e.Result = (int)_diamondCheck.FTIR_Measure(ControlNumber, false);
+            }
+            catch (Exception ex)
+            {
+                e.Result = 9999;
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+        void DoMeasurementCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            DriftOpen();
+
+            int timeout = 60 * 1000;
+            int elapsed = 0;
+            while (!Drift.IsOpen && elapsed < timeout)
+            {
+                Thread.Sleep(500);
+                elapsed += 500;
+            }
+
+            if (!Drift.IsOpen)
+            {
+                FTIREvent ev = new FTIREvent(EventType.Error, "Drift open failed", null);
+                DeviceEvent d = new DeviceEvent(DeviceName, ev);
+                EventBus.Instance.PostEvent(d);
+            }
+
+            int res = (int)e.Result;
+            if (res != 9999)
+            {
+                string info = "";
+                if(res == 1)
+                {
+                    info = "Non-Diamond";
+                } else if(res == 2)
+                {
+                    info = "Refer";
+                } else if(res == 3)
+                {
+                    info = "Pass";
+                }
+                FTIREvent evb = new FTIREvent(EventType.Info, "Measurement completed: " + info, null);
+                DeviceEvent de = new DeviceEvent(DeviceName, evb);
+                EventBus.Instance.PostEvent(de);
+            }
+            else
+            {
+                FTIREvent evb = new FTIREvent(EventType.Info, "Measurement failed", null);
+                DeviceEvent de = new DeviceEvent(DeviceName, evb);
+                EventBus.Instance.PostEvent(de);
+            }
+        }
+
+        public override bool CalibrateEx()
+        {
+            BackgroundWorker bw = new BackgroundWorker();
+            bw.DoWork += new DoWorkEventHandler(DoCalibration);
+            bw.RunWorkerCompleted += new RunWorkerCompletedEventHandler(DoCalibrationCompleted);
+            bw.RunWorkerAsync();
+
+            return true;
+        }
+
+        public override bool ConnectEx()
+        {
+            //status = UtilsLib.Status.Ready;
+            return true;
+        }
+
+        public override bool DisconnectEx()
+        {
+            int res = (int)_diamondCheck.FTIR_End();
+            return res == 0 ? true : false;
+        }
+
+        public override bool InitialStone(string ctlNum)
+        {
+            ControlNumber = ctlNum;
+            return true;
+        }
+
+        public override bool IsDeviceReady()
+        {
+            return Connected && Calibrated && Drift.IsOpen;
+        }
+
+        public override bool MeasureEx()
+        {
+            BackgroundWorker bw = new BackgroundWorker();
+            bw.DoWork += new DoWorkEventHandler(DoMeasurement);
+            bw.RunWorkerCompleted += new RunWorkerCompletedEventHandler(DoMeasurementCompleted);
+            bw.RunWorkerAsync();
+
+            return true;
+        }
+
+        public override bool NeedCalibration()
+        {
+            return !Calibrated;
+        }
+    }
+}

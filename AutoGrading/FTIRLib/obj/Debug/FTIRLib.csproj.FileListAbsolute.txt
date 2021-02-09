@@ -1,0 +1,9 @@
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\Debug\FTIRLib.dll
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\Debug\FTIRLib.pdb
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\Debug\UtilsLib.dll
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\Debug\UtilsLib.pdb
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\Debug\FTIRLib.csprojAssemblyReference.cache
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\Debug\FTIRLib.csproj.CoreCompileInputs.cache
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\Debug\FTIRLib.csproj.CopyComplete
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\Debug\FTIRLib.dll
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\Debug\FTIRLib.pdb

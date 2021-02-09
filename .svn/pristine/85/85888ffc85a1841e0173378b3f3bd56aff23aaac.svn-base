@@ -1,0 +1,52 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UtilsLib;
+
+namespace FTIRLib
+{
+    public class FTIRManager : DeviceManager
+    {
+        public FTIRManager(string name)
+        {
+            DeviceName = "FTIR";
+        }
+
+        public override bool CalibrateEx()
+        {
+            return base.CalibrateEx();
+        }
+
+        public override bool ConnectEx()
+        {
+            return base.ConnectEx();
+        }
+
+        public override bool DisconnectEx()
+        {
+            return base.DisconnectEx();
+        }
+
+        public override bool InitialStone(string ctlNum)
+        {
+            return base.InitialStone(ctlNum);
+        }
+
+        public override bool IsDeviceReady()
+        {
+            return base.IsDeviceReady();
+        }
+
+        public override bool MeasureEx()
+        {
+            return base.MeasureEx();
+        }
+
+        public override bool NeedCalibration()
+        {
+            return base.NeedCalibration();
+        }
+    }
+}

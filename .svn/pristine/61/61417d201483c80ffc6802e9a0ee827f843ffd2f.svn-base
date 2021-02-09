@@ -1,0 +1,342 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using UtilsLib;
+
+namespace AutoGrading.Model
+{
+    public delegate void ImageReceivedEventHandler(ImageReceived img);
+
+    public class URobotManager : DeviceManager
+    {
+        public event ImageReceivedEventHandler ImageReceivedEvent;
+
+        Thread listenerThread = null;
+        TcpListener tcpListener = null;
+
+        Thread clientThread = null;
+        TcpClient tcpURClient = null;
+
+        bool forever = true;
+        bool foreverClient = true;
+
+        public URobotManager(string name) : base(name)
+        {
+            // create the server thread
+            listenerThread = new Thread(TcpListenerThread);
+            listenerThread.Start();
+
+            Thread.Sleep(2000);
+
+            // create the client thread
+            clientThread = new Thread(TcpClientThread);
+            clientThread.Start();
+            Thread.Sleep(2000);
+        }
+
+        ~URobotManager()
+        {
+            listenerThread.Join();
+            clientThread.Join();
+        }
+
+        void RaiseImageReceivedEvent(ImageReceived image)
+        {
+            ImageReceivedEvent?.Invoke(image);
+        }
+
+        public void AddImageReceivedEventSubscriber(ImageReceivedEventHandler handler)
+        {
+            ImageReceivedEvent += handler;
+        }
+
+        public void StopListenerThread()
+        {
+            forever = false;
+
+            Thread.Sleep(1000);
+            if (listenerThread.IsAlive)
+            {
+                if (tcpListener != null)
+                {
+                    if (device != null)
+                    {
+                        ((TcpClient)device).Close();
+                    }
+                    tcpListener.Stop();
+                }
+            }
+        }
+
+        public void StopClientThread()
+        {
+            foreverClient = false;
+
+            Thread.Sleep(1000);
+            if (clientThread.IsAlive)
+            {
+                if(tcpURClient != null)
+                {
+                    tcpURClient.Close();
+                }
+            }
+        }
+
+        private void TcpListenerThread()
+        {
+            // The IP address of the server (the PC on which this program is running)
+            string sHostIpAddress = App.Settings.HostIPAddress;//"127.0.0.1";// "192.168.1.153";
+            // Standard port number
+            int nPort = App.Settings.HostPort;
+
+            Console.WriteLine("Opening IP Address: " + sHostIpAddress);
+            IPAddress ipAddress = IPAddress.Parse(sHostIpAddress);        // Create the IP address
+            Console.WriteLine("Starting to listen on port: " + nPort);
+            tcpListener = new TcpListener(ipAddress, nPort);  // Create the tcp Listener
+            try
+            {
+                tcpListener.Start();
+            } catch(Exception ex)
+            {
+                return;
+            }
+            // Keep on listening forever
+            while (forever)
+            {
+                try
+                {
+                    TcpClient tcpClient = tcpListener.AcceptTcpClient();        // Accept the client
+
+                    URobotResult res = null;
+                    URobotEvent evb = new URobotEvent(EventType.Status, "Connected", null);
+                    DeviceEvent eb = new DeviceEvent(DeviceName, evb);
+                    EventBus.Instance.PostEvent(eb);
+                    if (device == null)
+                    {
+                        device = tcpClient;
+                        status = UtilsLib.Status.Ready;
+                    } else
+                    {
+                        evb = new URobotEvent(EventType.Error, "Multiple Tcp client connection", null);
+                        eb = new DeviceEvent(DeviceName, evb);
+                        EventBus.Instance.PostEvent(eb);
+                    }
+                    Console.WriteLine("Accepted new client");
+                    NetworkStream stream = tcpClient.GetStream();               // Open the network stream
+                    while (tcpClient.Client.Connected)
+                    {
+                        // Create a byte array for the available bytes
+                        byte[] arrayBytesRequest = new byte[tcpClient.Available];
+                        // Read the bytes from the stream
+                        int nRead = stream.Read(arrayBytesRequest, 0, arrayBytesRequest.Length);
+                        if (nRead > 0)
+                        {
+                            // Convert the byte array into a string
+                            string sMsgRequest = ASCIIEncoding.ASCII.GetString(arrayBytesRequest);
+                            Console.WriteLine("Received message request: " + sMsgRequest);
+
+                            // do not response to message "ack"
+                            if (sMsgRequest.Length > 0 && sMsgRequest != "ack")
+                            {
+                                // using thread pool
+                                //string id = sMsgRequest.Substring(0, 1);
+                                //string msg = sMsgRequest.Substring(1);
+                                //evb = new URobotEvent(EventType.Status, msg, null, id);
+                                
+                                // 1. ack the message received
+                                //byte[] arrayBytesAnswer = ASCIIEncoding.ASCII.GetBytes("ack");
+                                //stream.Write(arrayBytesAnswer, 0, arrayBytesAnswer.Length);
+
+                                // 2. process message in event bus
+                                evb = new URobotEvent(EventType.Status, sMsgRequest, null);
+                                eb = new DeviceEvent(DeviceName, evb);
+                                EventBus.Instance.PostEvent(eb);
+                            }
+                        }
+                        else
+                        {
+                            if (tcpClient.Available == 0)
+                            {
+                                Console.WriteLine("Client closed the connection.");
+                                // No bytes read, and no bytes available, the client is closed.
+                                stream.Close();
+
+                                device = null;
+                                status = UtilsLib.Status.DisConnected;
+
+                                evb = new URobotEvent(EventType.Status, "Disconnected", null);
+                                eb = new DeviceEvent(DeviceName, evb);
+                                EventBus.Instance.PostEvent(eb);
+                            }
+                        }
+                    }
+                }
+                catch (SocketException e)
+                {
+                    if ((e.SocketErrorCode == SocketError.Interrupted))
+                    {
+                        // a blocking listen has been cancelled
+                        URobotEvent evb = new URobotEvent(EventType.Error, "SocketError: Interrupted and Disconnected", null);
+                        DeviceEvent eb = new DeviceEvent(DeviceName, evb);
+                        EventBus.Instance.PostEvent(eb);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("TcpListener Exception: " + ex.Message);
+                    URobotEvent evb = new URobotEvent(EventType.Error, "TCPListener Exception and Disconnected " + ex.Message, null);
+                    DeviceEvent eb = new DeviceEvent(DeviceName, evb);
+                    EventBus.Instance.PostEvent(eb);
+                }
+            }
+        }
+
+        private void TcpClientThread()
+        {
+            int port = App.Settings.URHostPort;
+            string server = App.Settings.URHostIPAddress;
+
+            while (foreverClient)
+            {
+                try
+                {
+                    tcpURClient = new TcpClient();
+                    tcpURClient.NoDelay = true;
+                    if (!tcpURClient.Connected)
+                    {
+                        tcpURClient.Connect(server, port);
+                        tcpURClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    }
+
+                    URobotEvent evb = null;
+                    DeviceEvent eb = null;
+
+                    if (deviceClient == null)
+                    {
+                        deviceClient = tcpURClient;
+
+                        evb = new URobotEvent(EventType.Status, "Connected", null, "Client");
+                        eb = new DeviceEvent(DeviceName, evb);
+                        EventBus.Instance.PostEvent(eb);
+                    }
+                    else
+                    {
+                        evb = new URobotEvent(EventType.Error, "Multiple Tcp client connection", null, "Client");
+                        eb = new DeviceEvent(DeviceName, evb);
+                        EventBus.Instance.PostEvent(eb);
+                    }
+
+                    NetworkStream stream = tcpURClient.GetStream();
+                    Byte[] data = new Byte[256];
+                    while (tcpURClient.Connected && foreverClient)
+                    {
+                        // String to store the response ASCII representation.
+                        string responseData = string.Empty;
+
+                        // Read the first batch of the TcpServer response bytes.
+                        int bytes = stream.Read(data, 0, data.Length);
+                        if (bytes > 0)
+                        {
+                            responseData = System.Text.Encoding.ASCII.GetString(data, 0, bytes);
+                            Console.WriteLine("Received from robot host: {0}", responseData);
+                            evb = new URobotEvent(EventType.Status, responseData, null, "Client");
+                            eb = new DeviceEvent(DeviceName, evb);
+                            EventBus.Instance.PostEvent(eb);
+                        } else
+                        {
+                            if (tcpURClient.Available == 0)
+                            {
+                                Console.WriteLine("Host closed the onnection");
+                                // No bytes read, and no bytes available, the client is closed.
+                                stream.Close();
+
+                                deviceClient = null;
+
+                                evb = new URobotEvent(EventType.Status, "Disconnected", null, "Client");
+                                eb = new DeviceEvent(DeviceName, evb);
+                                EventBus.Instance.PostEvent(eb);
+                            }
+                        }
+                    }
+                }
+                catch (SocketException e)
+                {
+                    URobotEvent evb = new URobotEvent(EventType.Error, e.Message, null, "Client");
+                    DeviceEvent eb = new DeviceEvent(DeviceName, evb);
+                    EventBus.Instance.PostEvent(eb);
+
+                    if ((e.SocketErrorCode == SocketError.Interrupted))
+                    {
+                        // a blocking listen has been cancelled
+                        evb = new URobotEvent(EventType.Error, "SocketError: Interrupted and Disconnected", null, "Client");
+                        eb = new DeviceEvent(DeviceName, evb);
+                        EventBus.Instance.PostEvent(eb);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("TcpListener Exception: " + ex.Message);
+                    URobotEvent evb = new URobotEvent(EventType.Error, "TCPListener Exception and Disconnected " + ex.Message, null, "Client");
+                    DeviceEvent eb = new DeviceEvent(DeviceName, evb);
+                    EventBus.Instance.PostEvent(eb);
+                }
+            }
+        }
+
+        public override bool DisconnectEx()
+        {
+            StopListenerThread();
+            StopClientThread();
+            return true;
+        }
+
+        public override bool Send(string msg, bool client = false)
+        {
+            if (device != null || deviceClient != null)
+            {
+                return SendMsgEx(msg, client);
+            }
+            else
+            {
+                Console.WriteLine("Error: no connected tcp client");
+                return false;
+            }
+        }
+
+        bool SendMsgEx(string msg, bool client)
+        {
+            try
+            {
+                if (client)
+                {
+                    NetworkStream stream = ((TcpClient)deviceClient).GetStream();
+                    Byte[] sendBytes = Encoding.ASCII.GetBytes(msg);
+                    stream.Write(sendBytes, 0, sendBytes.Length);
+                    return true;
+                }
+                else
+                {
+                    NetworkStream stream = ((TcpClient)device).GetStream();
+                    Byte[] sendBytes = Encoding.ASCII.GetBytes(msg);
+                    stream.Write(sendBytes, 0, sendBytes.Length);
+
+                    return true;
+                }
+            }
+            catch(SocketException se)
+            {
+                Console.WriteLine("Error: SendMsgEx socket exception  " + se.Message);
+            }catch (Exception ex)
+            {
+                Console.WriteLine("Error: SendMsgEx exception " + ex.Message);
+            }
+            return false;
+        }
+    }
+}

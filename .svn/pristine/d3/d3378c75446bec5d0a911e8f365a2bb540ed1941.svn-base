@@ -1,0 +1,193 @@
+﻿<Window x:Class="AutoGrading.View.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:i="http://schemas.microsoft.com/expression/2010/interactivity"
+        xmlns:vm="clr-namespace:AutoGrading.ViewModel"
+        xmlns:model="clr-namespace:AutoGrading.Model"
+        xmlns:local="clr-namespace:AutoGrading.View"
+        mc:Ignorable="d"
+        Title="MainWindow" Height="450" Width="800">
+    <Window.Resources>
+        <model:InverseBooleanConverter x:Key="inverseBoolConverter" />
+    </Window.Resources>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"></RowDefinition>
+            <RowDefinition Height="*" ></RowDefinition>
+        </Grid.RowDefinitions>
+        <StackPanel>
+            <Grid>
+                <ToolBarTray x:Name="toolBar" DataContext="{Binding ControlVM}" VerticalAlignment="Center">
+                    <ToolBar Margin="0" Band="1" BandIndex="1" >
+                        <Button ToolTip="Connect to Camera" VerticalAlignment="Center" Style="{StaticResource ToolbarButton}"
+                                Command="{Binding CommandConnectAll}">
+                            <Image Source="pack://application:,,,/Images/camera.png" />
+                        </Button>
+                    </ToolBar>
+                    <ToolBar Margin="0" Band="1" BandIndex="2" IsEnabled="{Binding Connected}" VerticalAlignment="Center">
+                        <Button ToolTip="Calibrate" Style="{StaticResource ToolbarButton}"
+                                Command="{Binding CommandCalibrateAll}">
+                            <Image Source="pack://application:,,,/Images/calibrate_ref.png" Width="24"/>
+                        </Button>
+                        <Button ToolTip="Measure" Style="{StaticResource ToolbarButton}"
+                            Command="{Binding CommandMeasureAll}">
+                            <Image Source="pack://application:,,,/Images/measurement.png" Height="24"/>
+                        </Button>
+                    </ToolBar>
+                </ToolBarTray>
+                <ToolBarTray DataContext="{Binding ControlVM}" HorizontalAlignment="Right" VerticalAlignment="Center" Width="Auto" Height="{Binding ElementName=toolBar, Path=ActualHeight}">
+                    <ToolBar IsEnabled="{Binding Connected}" ToolBarTray.IsLocked="True" Margin="0" VerticalAlignment="Center">
+                        <Button ToolTip="Resume UR from halt"
+                            Command="{Binding CommandURResume}">
+                            <Image Source="pack://application:,,,/Images/resume.png" Height="24"/>
+                        </Button>
+                        <Button ToolTip="Hemisphere Open"
+                            Command="{Binding CommandOpenHemisphere}">
+                            <Image Source="pack://application:,,,/Images/open-cover.png" Height="24"/>
+                        </Button>
+                        <Button ToolTip="Hemisphere Close"
+                            Command="{Binding CommandCloseHemisphere}">
+                            <Image Source="pack://application:,,,/Images/close-cover.png" Height="24"/>
+                        </Button>
+                        <ToggleButton ToolTip="Halogen Light On/Off"
+                            IsChecked="{Binding MainLight}">
+                            <Image Source="pack://application:,,,/Images/light.png" />
+                        </ToggleButton>
+                        <Button ToolTip="stage settings" Style="{StaticResource ToolbarButton}"
+                            Command="{Binding CommandStageSettings}">
+                            <Image Source="pack://application:,,,/Images/stagesettings.png" Height="24"/>
+                        </Button>
+                    </ToolBar>
+                </ToolBarTray>
+            </Grid>
+        </StackPanel>
+        <Grid Grid.Row="1" DataContext="{Binding ControlVM}">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"></RowDefinition>
+                <RowDefinition Height="24"></RowDefinition>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="3*"></ColumnDefinition>
+                    <ColumnDefinition Width="5"></ColumnDefinition>
+                    <ColumnDefinition Width="*"></ColumnDefinition>
+                </Grid.ColumnDefinitions>
+                <Border Grid.Column="0">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="200" />
+                            <ColumnDefinition Width="5" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid Grid.Column="0" Margin="5, 10">
+                            <StackPanel>
+                                <ListBox Name="DeviceList" MinHeight="20" ItemsSource="{Binding Path=DeviceManagers, Mode=TwoWay}" SelectedItem="{Binding Path=SelectedDevice, Mode=TwoWay}">
+                                    <ListBox.ItemContainerStyle>
+                                        <Style TargetType="ListBoxItem">
+                                            <Setter Property="Focusable" Value="False"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding status}" Value="2">
+                                                    <Setter Property="Background" Value="LightGray" />
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding status}" Value="1">
+                                                    <Setter Property="Background" Value="Orange" />
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding status}" Value="0">
+                                                    <Setter Property="Background" Value="LightGreen" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </ListBox.ItemContainerStyle>
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,1">
+                                                <TextBlock Text="{Binding DeviceName}" HorizontalAlignment="Center">
+                                                </TextBlock>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                                <Button Style="{StaticResource ToolbarButton}" Command="{Binding CommandCalibrate}" Margin="2,5" ToolTip="Calibrate device">
+                                    Calibrate
+                                </Button>
+                                <Button Style="{StaticResource ToolbarButton}" Command="{Binding CommandStartProcess}" Margin="2,5" ToolTip="Start measurement">
+                                    Start
+                                </Button>
+                                <Grid Margin="5,5">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"></ColumnDefinition>
+                                        <ColumnDefinition Width="*"></ColumnDefinition>
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="auto"></RowDefinition>
+                                        <RowDefinition Height="auto"></RowDefinition>
+                                        <RowDefinition Height="auto"></RowDefinition>
+                                        <RowDefinition Height="auto"></RowDefinition>
+                                    </Grid.RowDefinitions>
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Proc ID: " HorizontalAlignment="Right"/>
+                                    <ComboBox Grid.Row="0" Grid.Column="1" Text="Please Select" ItemsSource="{Binding ProcIDs}" SelectedItem="{Binding ProcID, Mode=TwoWay}" Height="22" VerticalAlignment="Bottom">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding}" />
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Action: " HorizontalAlignment="Right"/>
+                                    <ComboBox Grid.Row="1" Grid.Column="1" Text="Please Select" ItemsSource="{Binding Actions}" SelectedItem="{Binding Action, Mode=TwoWay}" Height="22" VerticalAlignment="Bottom">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding}" />
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Location: " HorizontalAlignment="Right"/>
+                                    <ComboBox Grid.Row="2" Grid.Column="1" Text="Please Select" ItemsSource="{Binding Locations}" SelectedItem="{Binding Location, Mode=TwoWay}" Height="22" VerticalAlignment="Bottom">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding}" />
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <Button Grid.Row="3" Grid.ColumnSpan="2" Margin="20, 5" Content="Test" Command="{Binding CommandTestUR}" ToolTip="Test UR"/>
+                                </Grid>
+                            </StackPanel>
+                        </Grid>
+                        <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" />
+                        <Grid Margin="5, 10" Grid.Column="2" x:Name="gridCameraImage">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"></RowDefinition>
+                                <RowDefinition Height="5"></RowDefinition>
+                                <RowDefinition Height="*"></RowDefinition>
+                            </Grid.RowDefinitions>
+                            <Image Grid.Row="0" x:Name="ImageCV" Source="{Binding GColorImage}" VerticalAlignment="Center"></Image>
+                            <GridSplitter Margin="5, 0" Grid.Row="1" Height="5" HorizontalAlignment="Stretch" />
+                            <Image Grid.Row="2" x:Name="ImageAF" Source="{Binding GUVImage}" VerticalAlignment="Center"></Image>
+                        </Grid>
+                    </Grid>
+                </Border>
+                <GridSplitter Background="#FFD3D3D3"  Grid.Column="1" Width="5" HorizontalAlignment="Stretch" />
+                <DockPanel Grid.Column="2" DataContext="{Binding LogEntryVM}">
+                    <ListBox ItemsSource="{Binding LogEntries}" Style="{StaticResource LogViewerStyle}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <i:Interaction.Behaviors>
+                            <vm:AutoScrollBehavior />
+                        </i:Interaction.Behaviors>
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="{x:Type ListBoxItem}">
+                                <Setter Property="Focusable" Value="False"/>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                    </ListBox>
+                </DockPanel>
+            </Grid>
+            <Grid Grid.Row="1" Grid.ColumnSpan="3" Background="LightGray">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="0.8*"></ColumnDefinition>
+                    <ColumnDefinition></ColumnDefinition>
+                </Grid.ColumnDefinitions>
+                <!--<Label Grid.Column="0" HorizontalAlignment="Left" Content="{Binding Status}"></Label>-->
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

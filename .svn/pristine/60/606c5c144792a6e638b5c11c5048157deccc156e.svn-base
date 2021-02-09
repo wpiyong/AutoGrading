@@ -1,0 +1,1014 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.IO.Ports;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using System.Timers;
+using System.Windows;
+using UtilsLib;
+
+namespace gUVLib.Model
+{
+    public static class Hemisphere
+    {
+        static bool _motorConnected = false;
+#if (ETHERNET)
+        static UdpClient _udpClient = null;
+#else
+        static SerialPort _serialPort = null;
+#endif
+        static Timer _inputStatusPollTimer, _motorConnectTimer;
+        static Object _statusLock = new Object();
+        static SERVO_MOTOR_MODEL _model = SERVO_MOTOR_MODEL.ST5Q;
+        static byte _errorCount = 0;
+        static List<string> _openMotorCommands = new List<string>();
+        static List<string> _closeMotorCommands = new List<string>();
+
+        static object _commandActive = new object();
+        public static bool CommandActive { get; private set; }
+
+        static Timer _uvIntensityMonitorConnectTimer;
+        static SerialPort _uvSerialPort = null;
+        static bool _uvControllerConnected = false;
+        static SerialPort _arduinoSerialPort = null;
+        static bool _arduinoConnected = false;
+        static int _arduinoVersion = 0;
+
+        static System.Threading.Thread PollThread = null;
+        static bool PollThreadRunning = true;
+        static bool PollThreadPause = false;
+        static System.Threading.ManualResetEvent PollThreadManualResetEvent = null;
+
+        static volatile bool _abortConectMotor = false;
+
+        public static void StartConnectMotor()
+        {
+            if (LoadHemisphereMotorProfile())
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Connecting to hemisphere motor...")));
+                DeviceEvent e = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Connecting to hemisphere motor...", null));
+                EventBus.Instance.PostEvent(e);
+
+                _abortConectMotor = false;
+                _motorConnectTimer = new Timer();
+                _motorConnectTimer.Interval = 200;
+                _motorConnectTimer.AutoReset = false;
+                _motorConnectTimer.Elapsed += new ElapsedEventHandler(_motorConnectTimer_Elapsed);
+                _motorConnectTimer.Start();
+            }
+            else
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Failed to load motor profile")));
+                DeviceEvent e = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, "Failed to load motor profile", null));
+                EventBus.Instance.PostEvent(e);
+            }
+        }
+
+        public static void CancelConnectMotor()
+        {
+            _abortConectMotor = true;
+        }
+
+        public static void StartConnectUVSensor()
+        {
+            //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Connecting to UV monitor controller...")));
+            DeviceEvent e = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Connecting to UV monitor controller...", null));
+            EventBus.Instance.PostEvent(e);
+
+            _uvIntensityMonitorConnectTimer = new Timer();
+            _uvIntensityMonitorConnectTimer.Interval = 1000;
+            _uvIntensityMonitorConnectTimer.AutoReset = false;
+            _uvIntensityMonitorConnectTimer.Elapsed += new ElapsedEventHandler(_uvIntensityMonitorConnectTimer_Elapsed);
+            _uvIntensityMonitorConnectTimer.Start();
+        }
+
+        static bool LoadHemisphereMotorProfile()
+        {
+            bool result = false;
+            try
+            {
+                _openMotorCommands = new List<string>();
+                _closeMotorCommands = new List<string>();
+                int state = 0;
+
+                using (var reader = new StreamReader("gUVHemisphereMotorProfile.txt"))
+                {
+                    while (!reader.EndOfStream)
+                    {
+                        string line = reader.ReadLine();
+                        if (line.ToUpper() == "OPENPROFILE")
+                            state = 1;
+                        else if (line.ToUpper() == "CLOSEPROFILE")
+                            state = 2;
+                        else if (line.Trim().Length > 0)
+                        {
+                            switch (state)
+                            {
+                                case 1:
+                                    _openMotorCommands.Add(line);
+                                    break;
+                                case 2:
+                                    _closeMotorCommands.Add(line);
+                                    break;
+                            }
+                        }
+                    }
+                }
+
+
+                if (_openMotorCommands.Count == 0 || _closeMotorCommands.Count == 0)
+                {
+                    throw new Exception("Bad HemisphereMotorProfile.txt format");
+                }
+
+                result = true;
+            }
+            catch (Exception ex)
+            {
+                //App.LogEntry.AddEntry(ex.Message, true);
+                DeviceEvent e = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(e);
+                result = false;
+            }
+
+            return result;
+        }
+
+
+        public static bool UVcommand(bool open)
+        {
+            bool result = false;
+            try
+            {
+                if (!_arduinoConnected)
+                    throw new Exception("Arduino not connected");
+
+                for (int i = 0; i < 3; i++)
+                {
+                    _arduinoSerialPort.DiscardOutBuffer();
+                    _arduinoSerialPort.DiscardInBuffer();
+
+                    byte[] _openShutter = new byte[] { (byte)'O' };
+                    byte[] _closeShutter = new byte[] { (byte)'C' };
+
+                    if (open)
+                        _arduinoSerialPort.Write(_openShutter, 0, _openShutter.Length);
+                    else
+                        _arduinoSerialPort.Write(_closeShutter, 0, _closeShutter.Length);
+
+                    result = _arduinoSerialPort.ReadLine()[0] == 'A';
+
+                    if (result)
+                        break;
+                    else
+                        System.Diagnostics.Debug.WriteLine("no arduino ack");
+                }
+
+            }
+            catch (Exception ex)
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry(ex.Message, true)));
+                DeviceEvent e = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(e);
+            }
+
+            return result;
+        }
+
+        public static void Open(Object sender, DoWorkEventArgs e)
+        {
+            if (!_motorConnected) return;
+            if (IsOpen) return;
+
+            if (e != null) e.Result = false;
+
+            PollThreadManualResetEvent.Reset();
+            PollThreadPause = true;
+            System.Threading.Thread.Sleep(200);
+
+            if (System.Threading.Monitor.TryEnter(_commandActive, 12000))
+            {
+                try
+                {
+                    CommandActive = true;
+                    foreach (var command in _openMotorCommands)
+                    {
+#if (ETHERNET)
+                        WriteLine(command);
+                        System.Threading.Thread.Sleep(50);
+#else
+                        _serialPort.WriteLine(command);
+#endif
+
+                    }
+                }
+                catch (Exception ex)
+                {
+                    //App.LogEntry.AddEntry(ex.Message, true);
+                    DeviceEvent de = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                    EventBus.Instance.PostEvent(de);
+                    //throw;
+                }
+                finally
+                {
+                    System.Threading.Monitor.Exit(_commandActive);
+                    CommandActive = false;
+                }
+
+                System.Threading.Thread.Sleep(2000);
+
+                PollThreadPause = false;
+                PollThreadManualResetEvent.Set();
+
+                for (int i = 0; i < 400; i++)
+                {
+                    if (!IsOpen)
+                        System.Threading.Thread.Sleep(100);
+                    else
+                        break;
+                }
+                if (e != null) e.Result = IsOpen;
+            }
+        }
+
+        public static void Close(Object sender, DoWorkEventArgs e)
+        {
+            if (!_motorConnected) return;
+            if (IsClosed) return;
+
+            if (e != null) e.Result = false;
+
+            PollThreadManualResetEvent.Reset();
+            PollThreadPause = true;
+            System.Threading.Thread.Sleep(200);
+
+            if (System.Threading.Monitor.TryEnter(_commandActive, 25000))
+            {
+                try
+                {
+                    CommandActive = true;
+                    foreach (var command in _closeMotorCommands)
+                    {
+#if (ETHERNET)
+                        WriteLine(command);
+                        System.Threading.Thread.Sleep(50);
+#else
+                        _serialPort.WriteLine(command);
+#endif
+                    }
+                }
+                catch (Exception ex)
+                {
+                    //App.LogEntry.AddEntry(ex.Message, true);
+                    DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                    EventBus.Instance.PostEvent(ev);
+                    //throw;
+                }
+                finally
+                {
+                    System.Threading.Monitor.Exit(_commandActive);
+                    CommandActive = false;
+                }
+
+                System.Threading.Thread.Sleep(2000);
+
+                PollThreadPause = false;
+                PollThreadManualResetEvent.Set();
+
+                for (int i = 0; i < 400; i++)
+                {
+                    if (!IsClosed)
+                        System.Threading.Thread.Sleep(100);
+                    else
+                        break;
+                }
+                if (e != null) e.Result = IsClosed;
+            }
+        }
+
+#if(ETHERNET)
+        static void WriteLine(string s)
+        {
+            if (_udpClient != null)
+            {
+                Byte[] SCLstring = Encoding.ASCII.GetBytes(s);
+                // create a byte array that will be used for the actual
+                // transmission
+                Byte[] sendBytes = new Byte[SCLstring.Length + 3];
+                // insert opcode (07 is used for all SCL commands)
+                sendBytes[0] = 0;
+                sendBytes[1] = 7;
+                // copy string to the byte array
+                System.Array.Copy(SCLstring, 0, sendBytes, 2, SCLstring.Length);
+                // insert terminator
+                sendBytes[sendBytes.Length - 1] = 13; // CR
+                                                      // send it to the drive
+                _udpClient.Send(sendBytes, sendBytes.Length);
+            }
+        }
+
+        static string ReadLine()
+        {
+            string s = "";
+            if (_udpClient != null)
+            {
+                int count = 0;
+                while (count < 5)
+                {
+                    if (_udpClient.Available > 0) // is there a packet ready?
+                    {
+                        count = 5;
+                        // listen to specific host
+                        IPEndPoint RemoteIpEndPoint = new IPEndPoint(IPAddress.Parse(AppSettings.Instance.HemisphereIPAddress), AppSettings.Instance.HemispherePort);
+                        try
+                        {
+                            // Get the received packet. Receive method blocks
+                            // until a message returns on this socket from a remote host,
+                            // so always check .Available to see if a packet is ready.
+                            Byte[] receiveBytes = _udpClient.Receive(ref RemoteIpEndPoint);
+                            // strip opcode
+                            Byte[] SCLstringRec = new byte[receiveBytes.Length - 2];
+                            for (int m = 0; m < SCLstringRec.Length; m++)
+                                SCLstringRec[m] = receiveBytes[m + 2];
+                            s = Encoding.ASCII.GetString(SCLstringRec);
+                        }
+                        catch (Exception ex)
+                        {
+                            DeviceEvent e = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                            EventBus.Instance.PostEvent(e);
+                            s = "";
+                        }
+                    }
+                    else
+                    {
+                        count++;
+                        System.Threading.Thread.Sleep(100);
+                    }
+                }
+            }
+            return s;
+        }
+
+        static void CheckAck()
+        {
+            var response = ReadLine();
+            if (!response.Equals("%\r") && !response.Equals("*\r"))
+            {
+                throw new ApplicationException("The command was not acknowledged - please try again momentarily.");
+            }
+        }
+
+        static void _motorConnectTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            bool _hemiMotorFound = false;
+
+            _udpClient = new UdpClient(7777);
+            _udpClient.Client.ReceiveBufferSize = 50;
+            DeviceEvent de = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Trying to connect to Stepper Motor", null));
+            EventBus.Instance.PostEvent(de);
+
+            try
+            {
+                _udpClient.Connect(AppSettings.Instance.HemisphereIPAddress, AppSettings.Instance.HemispherePort);
+
+                WriteLine("PM");
+                System.Threading.Thread.Sleep(1000);
+                if (_udpClient.Available > 0) // is there a packet ready?
+                {
+                    string returnData = ReadLine();
+                    if (returnData != "" && returnData.Substring(3,1) == "2")
+                    {
+                        _hemiMotorFound = true;
+
+                        WriteLine("OP");
+                        System.Threading.Thread.Sleep(1000);
+                        de = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Hemisphere Option Board: " + ReadLine(), null));
+                        EventBus.Instance.PostEvent(de);
+
+                        WriteLine("SC");
+                        System.Threading.Thread.Sleep(1000);
+                        string response = ReadLine().Substring(3);
+                        de = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Hemisphere Status: 0x" + response, null));
+                        EventBus.Instance.PostEvent(de);
+                    }
+                    else
+                    {
+                        WriteLine("PM2");
+                        System.Threading.Thread.Sleep(1000);
+                        CheckAck();
+                        //App.LogEntry.AddEntry("ST5 : Please power cycle the Motor Drive and try connecting again", true);
+                        DeviceEvent ee = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, "Hemisphere : Please power cycle the Motor Drive and try connecting again", null));
+                        UtilsLib.EventBus.Instance.PostEvent(ee);
+                        return;
+                    }
+                }
+
+            }
+            catch (Exception ex)
+            {
+                _hemiMotorFound = false;
+                de = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(de);
+            }
+
+            if (!_hemiMotorFound)
+            {
+                if (_udpClient != null)
+                    _udpClient.Close();
+                if (!_abortConectMotor)
+                    _motorConnectTimer.Start();
+                return;
+            }
+
+            _motorConnected = true;
+            Application.Current.Dispatcher.BeginInvoke(new Action(System.Windows.Input.CommandManager.InvalidateRequerySuggested));
+
+            string status = "";
+            WriteLine("IS");
+            System.Threading.Thread.Sleep(1000);
+            status = ReadLine();
+            var hState = 0;
+            if (status.Length == 12)
+            {
+                status = status.Substring(3);
+                hState = (Convert.ToByte(status.Substring(5, 3), 2));
+            }
+
+            _isOpen = (hState & 0x5) == 0x5;
+            _isClosed = (hState & 0x6) == 0x6;
+
+            //_inputStatusPollTimer = new Timer();
+            //_inputStatusPollTimer.Interval = 200;
+            //_inputStatusPollTimer.AutoReset = false;
+            //_inputStatusPollTimer.Elapsed += new ElapsedEventHandler(_inputStatusPollTimer_Elapsed);
+            //_inputStatusPollTimer.Start();
+
+            PollThreadManualResetEvent = new System.Threading.ManualResetEvent(false);
+            PollThread = StartPollThread();
+            PollThread.Start();
+
+            //close on connect
+            Close(null, null);
+        }
+#else
+        static void _motorConnectTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            string[] ports = SerialPort.GetPortNames();
+            bool _hemiMotorFound = false;
+
+            foreach (string port in ports)
+            {
+                try
+                {
+                    if (_serialPort != null)
+                        _serialPort.Close();
+
+                    _serialPort = new SerialPort(port, 19200, Parity.None, 8, StopBits.One);
+                    _serialPort.DtrEnable = true;
+                    _serialPort.NewLine = "\r";
+                    _serialPort.Encoding = System.Text.Encoding.ASCII;
+                    _serialPort.ReadTimeout = 2000;
+                    _serialPort.WriteTimeout = 2000;
+
+                    if (!_serialPort.IsOpen)
+                        _serialPort.Open();
+
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.DiscardOutBuffer();
+
+                    //write some nulls
+                    _serialPort.Write("\0");
+                    _serialPort.Write("\0");
+                    _serialPort.Write("\0");
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.DiscardOutBuffer();
+
+                    _serialPort.WriteLine("MV");
+                    string mvRead = _serialPort.ReadLine();
+                    try
+                    {
+                        _model = (SERVO_MOTOR_MODEL)Convert.ToInt32(mvRead.Substring(4, 3)); ;
+                    }
+                    catch
+                    {
+                        //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Unsupported Hemisphere Motor Drive", true)));
+                        DeviceEvent ee = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, "Unsupported Hemisphere Motor Drive", null));
+                        EventBus.Instance.PostEvent(ee);
+                    }
+
+                    //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Hemisphere  Model/Revision: " + mvRead)));
+                    DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Hemisphere  Model/Revision: " + mvRead, null));
+                    EventBus.Instance.PostEvent(ev);
+                    _serialPort.WriteLine("OP");
+                    //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Hemisphere Option Board: " + _serialPort.ReadLine())));
+                    ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Hemisphere Option Board: " + _serialPort.ReadLine(), null));
+                    EventBus.Instance.PostEvent(ev);
+
+                    _serialPort.WriteLine("SC");
+                    string response = _serialPort.ReadLine().Substring(3);
+                    //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Hemisphere Status: 0x" + response)));
+                    ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Hemisphere Status: 0x" + response, null));
+                    EventBus.Instance.PostEvent(ev);
+
+                    _serialPort.WriteLine("BR");//baud rate 2 = 19200
+                    response = _serialPort.ReadLine().Substring(3);
+
+                    if (response == "2")
+                    {
+                        _hemiMotorFound = true;
+                        break;
+                    }
+                }
+                catch
+                {
+                    if (_serialPort != null)
+                        _serialPort.Close();
+                }
+
+            }
+
+            if (!_hemiMotorFound)
+            {
+                if (_serialPort != null)
+                    _serialPort.Close();
+                if (!_abortConectMotor)
+                    _motorConnectTimer.Start();
+                return;
+            }
+
+            _motorConnected = true;
+            Application.Current.Dispatcher.BeginInvoke(new Action(System.Windows.Input.CommandManager.InvalidateRequerySuggested));
+
+            string status = "";
+            _serialPort.DiscardInBuffer();
+            _serialPort.WriteLine("IS");
+            status = _serialPort.ReadLine();
+            var hState = 0;
+            if (status.Length == 11)
+            {
+                status = status.Substring(3);
+                hState = (Convert.ToByte(status.Substring(5, 3), 2));
+            }
+
+            _isOpen = (hState & 0x5) == 0x5;
+            _isClosed = (hState & 0x6) == 0x6;
+
+            _inputStatusPollTimer = new Timer();
+            _inputStatusPollTimer.Interval = 200;
+            _inputStatusPollTimer.AutoReset = false;
+            _inputStatusPollTimer.Elapsed += new ElapsedEventHandler(_inputStatusPollTimer_Elapsed);
+            _inputStatusPollTimer.Start();
+
+            //close on connect
+            Close(null, null);
+        }
+#endif
+
+        public static bool HemisphereMotorConnected
+        {
+            get { return _motorConnected; }
+        }
+        public static bool ArduinoConnected
+        {
+            get { return _arduinoConnected; }
+        }
+        public static int ArduinoVersion
+        {
+            get { return _arduinoVersion; }
+        }
+
+        static volatile bool _isOpen, _isClosed;
+        public static bool IsOpen
+        {
+            get
+            {
+                return _isOpen;
+            }
+            set
+            {
+                if (_isOpen != value)
+                {
+                    Application.Current.Dispatcher.BeginInvoke(new Action(System.Windows.Input.CommandManager.InvalidateRequerySuggested));
+                }
+
+                _isOpen = value;
+            }
+        }
+
+        public static bool IsClosed
+        {
+            get
+            {
+                return _isClosed;
+            }
+            set
+            {
+                if (_isClosed != value)
+                    Application.Current.Dispatcher.BeginInvoke(new Action(System.Windows.Input.CommandManager.InvalidateRequerySuggested));
+
+                _isClosed = value;
+            }
+        }
+
+
+        static void _inputStatusPollTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            try
+            {
+                string response = "";
+                lock (_statusLock)
+                {
+#if (ETHERNET)
+                    WriteLine("IS");
+                    System.Threading.Thread.Sleep(100);
+                    response = ReadLine();
+#else
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.WriteLine("IS");
+                    response = _serialPort.ReadLine();
+#endif
+                }
+
+                byte hState = 0;
+#if(ETHERNET)
+                if (response.Length == 12)
+#else
+                if (response.Length == 11)          
+#endif
+                {
+                    response = response.Substring(3);
+                    hState = (Convert.ToByte(response.Substring(6, 2), 2));
+                }
+                IsOpen = (hState & 0x1) == 0x1;
+                IsClosed = (hState & 0x2) == 0x2;
+
+                _inputStatusPollTimer.Start();
+                _errorCount = 0;
+            }
+            catch
+            {
+                if (_errorCount++ > 10) // 10 consecutive errors
+                {
+                    _errorCount = 0;
+                    _motorConnected = false;
+                    //_motorConnectTimer.Start();
+                }
+                else
+                    _inputStatusPollTimer.Start();
+            }
+
+
+        }
+
+        static void PollThreadEx()
+        {
+            while (PollThreadRunning)
+            {
+                try
+                {
+                    string response = "";
+                    lock (_statusLock)
+                    {
+#if (ETHERNET)
+                        WriteLine("IS");
+                        System.Threading.Thread.Sleep(100);
+                        response = ReadLine();
+#else
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.WriteLine("IS");
+                    response = _serialPort.ReadLine();
+#endif
+                    }
+
+                    byte hState = 0;
+#if (ETHERNET)
+                    if (response.Length == 12)
+                    {
+                        response = response.Substring(3);
+                        hState = (Convert.ToByte(response.Substring(6, 2), 2));
+
+                        IsOpen = (hState & 0x1) == 0x1;
+                        IsClosed = (hState & 0x2) == 0x2;
+
+                        _errorCount = 0;
+                    }
+#else
+                if (response.Length == 11)
+                {
+                    response = response.Substring(3);
+                    hState = (Convert.ToByte(response.Substring(6, 2), 2));
+
+                    IsOpen = (hState & 0x1) == 0x1;
+                    IsClosed = (hState & 0x2) == 0x2;
+
+                    _errorCount = 0;
+                }
+#endif
+
+                }
+                catch
+                {
+                    if (_errorCount++ > 10) // 10 consecutive errors
+                    {
+                        _errorCount = 0;
+                        _motorConnected = false;
+                        //_motorConnectTimer.Start();
+                    }
+                }
+
+                if (PollThreadPause)
+                {
+                    PollThreadManualResetEvent.WaitOne();
+                }
+
+                System.Threading.Thread.Sleep(200);
+            }
+        }
+
+        static System.Threading.Thread StartPollThread()
+        {
+            System.Threading.Thread t = new System.Threading.Thread(PollThreadEx);
+            return t;
+        }
+
+        public static void Disconnect()
+        {
+            PollThreadRunning = false;
+            PollThreadManualResetEvent.Set();
+            _udpClient.Close();
+        }
+
+        static void _uvIntensityMonitorConnectTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            string[] ports = SerialPort.GetPortNames();
+            _uvControllerConnected = false;
+
+            foreach (string port in ports)
+            {
+                try
+                {
+                    if (_uvSerialPort != null)
+                        _uvSerialPort.Close();
+
+                    _uvSerialPort = new SerialPort(port, 115200, Parity.None, 8, StopBits.One);
+                    _uvSerialPort.Encoding = System.Text.Encoding.ASCII;
+                    _uvSerialPort.NewLine = "\r\n";
+                    _uvSerialPort.DtrEnable = true;
+                    _uvSerialPort.RtsEnable = true;
+                    _uvSerialPort.ReadTimeout = 2000;
+                    _uvSerialPort.WriteTimeout = 2000;
+
+                    if (!_uvSerialPort.IsOpen)
+                        _uvSerialPort.Open();
+
+                    _uvSerialPort.DiscardInBuffer();
+                    _uvSerialPort.DiscardOutBuffer();
+
+                    byte[] buf = new byte[1];
+                    buf[0] = (byte)'U';
+                    _uvSerialPort.Write(buf, 0, 1);
+
+                    try
+                    {
+                        string id = _uvSerialPort.ReadLine();
+                        if (id == "Micro")
+                        {
+                            _uvControllerConnected = true;
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(ex.ToString());
+                        if (_uvSerialPort != null)
+                            _uvSerialPort.Close();
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(ex.ToString());
+                    if (_uvSerialPort != null)
+                        _uvSerialPort.Close();
+                }
+
+            }
+
+            if (!_uvControllerConnected)
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Could not connect to UV monitor controller.", true)));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, "Could not connect to UV monitor controller.", null));
+                EventBus.Instance.PostEvent(ev);
+                if (_uvSerialPort != null)
+                    _uvSerialPort.Close();
+                //_uvIntensityMonitorConnectTimer.Start();
+            }
+            else
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Connected to UV monitor controller.")));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Connected to UV monitor controller.", null));
+                EventBus.Instance.PostEvent(ev);
+                _arduinoConnect();
+            }
+
+
+        }
+
+        static void _arduinoConnect()
+        {
+            string[] ports = SerialPort.GetPortNames();
+            _arduinoConnected = false;
+
+            foreach (string port in ports)
+            {
+                try
+                {
+                    if (_arduinoSerialPort != null)
+                        _arduinoSerialPort.Close();
+
+                    _arduinoSerialPort = new SerialPort(port, 115200, Parity.None, 8, StopBits.One);
+                    _arduinoSerialPort.Encoding = System.Text.Encoding.ASCII;
+                    _arduinoSerialPort.NewLine = "\r\n";
+                    _arduinoSerialPort.ReadTimeout = 2000;
+                    _arduinoSerialPort.WriteTimeout = 2000;
+
+                    if (!_arduinoSerialPort.IsOpen)
+                        _arduinoSerialPort.Open();
+
+                    _arduinoSerialPort.DiscardInBuffer();
+                    _arduinoSerialPort.DiscardOutBuffer();
+
+                    byte[] buf = new byte[1];
+                    buf[0] = (byte)'U';
+                    _arduinoSerialPort.Write(buf, 0, 1);
+
+                    try
+                    {
+                        string id = _arduinoSerialPort.ReadLine();
+                        if (id == "Arduino")
+                        {
+                            _arduinoConnected = true;
+                            _arduinoVersion = 1;
+                            break;
+                        }
+                        else if (id == "Arduino2")
+                        {
+                            if (!LightControl.LightControl.SetMainLightCurrent(AppSettings.Instance.MainLightSetCurrent))
+                                throw new Exception("Could not set LED driver channel 2 ");
+
+                            _arduinoConnected = true;
+                            _arduinoVersion = 2;
+
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(ex.ToString());
+                        if (_arduinoSerialPort != null)
+                            _arduinoSerialPort.Close();
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(ex.ToString());
+                    if (_arduinoSerialPort != null)
+                        _arduinoSerialPort.Close();
+                }
+
+            }
+
+            if (!_arduinoConnected)
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Could not connect to Arduino controller.", true)));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, "Could not connect to Arduino controller.", null));
+                EventBus.Instance.PostEvent(ev);
+                if (_arduinoSerialPort != null)
+                    _arduinoSerialPort.Close();
+            }
+            else
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("Connected to Arduino controller.")));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "Connected to Arduino controller.", null));
+                EventBus.Instance.PostEvent(ev);
+                //Application.Current.Dispatcher.BeginInvoke(new Action(System.Windows.Input.CommandManager.InvalidateRequerySuggested));
+            }
+
+
+        }
+
+
+        public static int GetUVIntensity()
+        {
+            int result = -1;
+            try
+            {
+                if (!_uvControllerConnected)
+                    throw new Exception("UV monitor not connected");
+
+                _uvSerialPort.DiscardOutBuffer();
+                _uvSerialPort.DiscardInBuffer();
+
+                byte[] buf = new byte[1];
+                buf[0] = (byte)'G';
+                _uvSerialPort.Write(buf, 0, 1);
+
+                result = Convert.ToUInt16(_uvSerialPort.ReadLine());
+
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry("UV Intensity = " + result)));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Info, "UV Intensity = " + result, null));
+                EventBus.Instance.PostEvent(ev);
+            }
+            catch (Exception ex)
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry(ex.Message, true)));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(ev);
+            }
+
+            return result;
+        }
+
+        public static bool EnableDisableTrigger(bool enable)
+        {
+            bool result = false;
+            try
+            {
+                if (!_arduinoConnected)
+                    throw new Exception("Arduino not connected");
+
+                for (int i = 0; i < 3; i++)
+                {
+                    _arduinoSerialPort.DiscardOutBuffer();
+                    _arduinoSerialPort.DiscardInBuffer();
+
+                    byte[] enableTrigger = new byte[] { (byte)'B' };
+                    byte[] disableTrigger = new byte[] { (byte)'E' };
+
+                    if (enable)
+                        _arduinoSerialPort.Write(enableTrigger, 0, enableTrigger.Length);
+                    else
+                        _arduinoSerialPort.Write(disableTrigger, 0, disableTrigger.Length);
+
+                    result = _arduinoSerialPort.ReadLine()[0] == 'A';
+
+                    if (result)
+                        break;
+                }
+
+            }
+            catch (Exception ex)
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry(ex.Message, true)));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(ev);
+            }
+
+            return result;
+        }
+
+        public static bool EnableDisableRingLight(bool enable)
+        {
+            bool result = false;
+            try
+            {
+                if (!_arduinoConnected)
+                    throw new Exception("Arduino not connected");
+
+                for (int i = 0; i < 3; i++)
+                {
+                    _arduinoSerialPort.DiscardOutBuffer();
+                    _arduinoSerialPort.DiscardInBuffer();
+
+                    byte[] enableRingLight = new byte[] { (byte)'R' };
+                    byte[] disableRingLight = new byte[] { (byte)'D' };
+
+                    if (enable)
+                        _arduinoSerialPort.Write(enableRingLight, 0, enableRingLight.Length);
+                    else
+                        _arduinoSerialPort.Write(disableRingLight, 0, disableRingLight.Length);
+
+                    result = _arduinoSerialPort.ReadLine()[0] == 'A';
+
+                    if (result)
+                        break;
+                }
+
+            }
+            catch (Exception ex)
+            {
+                //Application.Current.Dispatcher.Invoke((Action)(() => App.LogEntry.AddEntry(ex.Message, true)));
+                DeviceEvent ev = new DeviceEvent("AccuFluo", new GUVEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(ev);
+            }
+
+            return result;
+        }
+    }
+}

@@ -1,0 +1,2006 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UtilsLib;
+using gColorLib;
+using ViewModelLib;
+using System.Windows;
+using System.Windows.Media.Imaging;
+using System.Threading;
+using System.Collections.ObjectModel;
+using AutoGrading.Model;
+using System.Net.Sockets;
+using System.ComponentModel;
+using System.Windows.Input;
+using gUVLib;
+using DplLib;
+using FTIRLib;
+
+namespace AutoGrading.ViewModel
+{
+    enum DeviceType
+    {
+        Pickup1 = 0,
+        FTIR,
+        ColorMeter,
+        AccuFluo,
+        DPL,
+        URobot,
+        Pickup2,
+        Size
+    };
+
+    class ProcessStatus
+    {
+        public bool pickedUp;
+        public bool readyCV;
+        public bool stoneOnCV;
+        public bool removedCV;
+        public bool dropped;
+        public bool robot_ready;
+        public bool error;
+        public ManualResetEvent processEvent;
+        public int index;
+        public string controlNum;
+        public ProcessStatus(int index)
+        {
+            this.index = index;
+        }
+        public ProcessStatus(int index, string ctlNum)
+        {
+            this.index = index;
+            controlNum = ctlNum;
+        }
+        public ProcessStatus(int index, ManualResetEvent pe)
+        {
+            this.index = index;
+            processEvent = pe;
+        }
+    }
+
+    class URHostStatus
+    {
+        public bool poweringon;
+        public bool idle;
+        public bool loadingprogram;
+        public bool brakereleasing;
+        public bool running;
+        public bool startingprogram;
+        public bool poweringoff;
+        public bool poweroff;
+    }
+
+    class WorkArg
+    {
+        public ProcessStatus procStatus;
+        public string threadName;
+        public ManualResetEvent processEvent;
+        public bool EvEnd;
+        public WorkArg(ProcessStatus procStatus, string threadName, ManualResetEvent processEvent)
+        {
+            this.procStatus = procStatus;
+            this.threadName = threadName;
+            this.processEvent = processEvent;
+            this.EvEnd = false;
+        }
+    }
+
+    class WorkQueue
+    {
+        public readonly object aLock = new object();
+        public AutoResetEvent queueEvent = new AutoResetEvent(false);
+
+        private Queue<ProcessStatus> _queue;
+
+        public WorkQueue()
+        {
+            _queue = new Queue<ProcessStatus>();
+        }
+
+        public void Enqueue(ProcessStatus v)
+        {
+            // TODO: exception handling for _queue.Length reaches Max value.
+            lock (aLock)
+            {
+                _queue.Enqueue(v);
+                queueEvent.Set();
+            }
+        }
+
+        public ProcessStatus Dequeue()
+        {
+            // TODO: exception handling for _queue is empty
+            lock (aLock)
+            {
+                if (Length > 0)
+                {
+                    return _queue.Dequeue();
+                } else
+                {
+                    return null;
+                }
+            }
+        }
+
+        private int Length
+        { get { return _queue.Count; } }
+    }
+
+    class ThreadPool
+    {
+        ControlViewModel instance;
+        Thread[] threads = null;
+        public WorkArg[] WorkArgs = null;
+
+        public int NumWorkers;
+
+        public ThreadPool(ControlViewModel instance, int num)
+        {
+            NumWorkers = num;
+            threads = new Thread[NumWorkers];
+            WorkArgs = new WorkArg[NumWorkers];
+
+            this.instance = instance;
+            for (int i = 0; i < NumWorkers; ++i)
+            {
+                threads[i] = new Thread(new ParameterizedThreadStart(instance.StartWorker));
+                threads[i].Name = i.ToString();
+
+                WorkArgs[i] = new WorkArg(null, threads[i].Name, new ManualResetEvent(false));
+            }
+        }
+
+        public void Start()
+        {
+            for (int i = 0; i < NumWorkers; ++i)
+            {
+                threads[i].Start(WorkArgs[i]);
+            }
+        }
+
+        public void Join()
+        {
+            for (int i = 0; i < NumWorkers; ++i)
+            {
+                threads[i].Join();
+            }
+        }
+
+        public void End()
+        {
+            for (int i = 0; i < NumWorkers; ++i)
+            {
+                WorkArgs[i].EvEnd = true;
+                WorkArgs[i].processEvent.Set();
+                Thread.Sleep(20);
+            }
+        }
+    }
+
+    public class ControlViewModel : ViewModelLib.ViewModelBase
+    {
+        List<DeviceManager> DeviceManagers = new List<DeviceManager>();
+
+        public LogEntryViewModel LogEntryVM { get { return App.LogEntry; } }
+
+        public RelayCommand CommandConnectAll { get; set; }
+        public RelayCommand CommandStageSettings { get; set; }
+        public RelayCommand CommandCalibrateAll { get; set; }
+        public RelayCommand CommandMeasureAll { get; set; }
+        public RelayCommand CommandStartProcess { get; set; }
+        public RelayCommand CommandTestUR { get; set; }
+        ManualResetEvent ProcessEvent = new ManualResetEvent(false);
+        ManualResetEvent UREvent = new ManualResetEvent(false);
+        
+        public ObservableCollection<string> Devices { get; set; }
+        bool processing = false;
+        static int count = 0;
+        static int NumWorkers = 2;
+        WorkQueue workQueue = null;
+        ThreadPool threadPool = null;
+        bool usingThreadPool = false;
+
+        Thread urThread = null;
+        URHostStatus urHostStatus = null;
+
+        List<ProcessStatus> processStatusList = new List<ProcessStatus>();
+        List<DeviceStatus> deviceStatusList = new List<DeviceStatus>();
+
+        public ControlViewModel()
+        {
+            EventBus.Instance.Register(this);
+            Devices = new ObservableCollection<string>();
+            for(int i = 0; i <= (int)DeviceType.Size; i++)
+            {
+                if(((DeviceType)i).ToString() == "ColorMeter" && App.Settings.Devices.Contains("ColorMeter"))
+                {
+                    gColorManager manager = new gColorManager("ColorMeter");
+                    DeviceManagers.Add(manager);
+                    manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if (((DeviceType)i).ToString() == "URobot" && App.Settings.Devices.Contains("URobot"))
+                {
+                    URobotManager manager = new URobotManager("URobot");
+                    DeviceManagers.Add(manager);
+                    manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if(((DeviceType)i).ToString() == "AccuFluo" && App.Settings.Devices.Contains("AccuFluo"))
+                {
+                    gUVManager manager = new gUVManager("AccuFluo");
+                    DeviceManagers.Add(manager);
+                    manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if (((DeviceType)i).ToString() == "DPL" && App.Settings.Devices.Contains("DPL"))
+                {
+                    DplManager manager = new DplManager("DPL");
+                    DeviceManagers.Add(manager);
+                    //manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if (((DeviceType)i).ToString() == "FTIR" && App.Settings.Devices.Contains("FTIR"))
+                {
+                    FTIRManager manager = new FTIRManager("FTIR");
+                    DeviceManagers.Add(manager);
+                    //manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if (((DeviceType)i).ToString() == "Pickup1" && App.Settings.Devices.Contains("Pickup1"))
+                {
+                    DeviceManager manager = new DeviceManager("Pickup1");
+                    DeviceManagers.Add(manager);
+                    //manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if (((DeviceType)i).ToString() == "Pickup2" && App.Settings.Devices.Contains("Pickup2"))
+                {
+                    DeviceManager manager = new DeviceManager("Pickup2");
+                    DeviceManagers.Add(manager);
+                    //manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+            }
+
+            for(int i = 0; i < (int)DeviceType.URobot; i++)
+            {
+                DeviceStatus ds = new DeviceStatus(Status.Ready);
+                deviceStatusList.Add(ds);
+            }
+
+            CommandConnectAll = new RelayCommand(param => ConnectAll());
+            CommandStageSettings = new RelayCommand(param => StageSettings());
+            CommandCalibrateAll = new RelayCommand(param => CalibrateAll());
+            CommandMeasureAll = new RelayCommand(param => MeasureAll());
+            CommandStartProcess = new RelayCommand(param => StartProcess(), cc=> { return !processing; });
+            CommandTestUR = new RelayCommand(param => TestUR());
+
+            if (usingThreadPool)
+            {
+                workQueue = new WorkQueue();
+                threadPool = new ThreadPool(this, NumWorkers);
+                threadPool.Start();
+            }
+
+            urThread = InitialURThread();
+        }
+        
+        #region properties
+
+        BitmapSource _gColorImage;
+        public BitmapSource GColorImage
+        {
+            get { return _gColorImage; }
+            set
+            {
+                _gColorImage = value;
+                OnPropertyChanged("GColorImage");
+            }
+        }
+
+        BitmapSource _gUVImage;
+        public BitmapSource GUVImage
+        {
+            get { return _gUVImage; }
+            set
+            {
+                _gUVImage = value;
+                OnPropertyChanged("GUVImage");
+            }
+        }
+
+        BitmapSource _uRobotImage;
+        public BitmapSource URobotImage
+        {
+            get { return _uRobotImage; }
+            set
+            {
+                _uRobotImage = value;
+                OnPropertyChanged("URobotImage");
+            }
+        }
+
+        string _selectedDevice;
+        public string SelectedDevice
+        {
+            get { return _selectedDevice; }
+            set
+            {
+                _selectedDevice = value;
+                OnPropertyChanged("SelectedDevice");
+            }
+        }
+
+        bool _isPickupOp = true;
+        public bool IsPickupOp
+        {
+            get { return _isPickupOp; }
+            set
+            {
+                _isPickupOp = value;
+                OnPropertyChanged("IsPickupOp");
+            }
+        }
+
+        #endregion
+
+        public void ConnectingDevices()
+        {
+
+        }
+
+        void ConnectAll()
+        {
+            for(int i = 0; i < DeviceManagers.Count; i++)
+            {
+                DeviceManager dm = DeviceManagers[i];
+                dm.ConnectEx();
+            }
+        }
+
+        void StageSettings()
+        {
+
+        }
+
+        void CalibrateAll()
+        {
+            for (int i = 0; i < DeviceManagers.Count; i++)
+            {
+                DeviceManager dm = DeviceManagers[i];
+                dm.CalibrateEx();
+            }
+        }
+
+        void MeasureAll()
+        {
+            //for (int i = 0; i < DeviceManagers.Count; i++)
+            //{
+            //    ProcessEvent.Reset();
+            //    DeviceManager dm = DeviceManagers[i];
+            //    dm.MeasureEx();
+            //    //ProcessEvent.WaitOne();
+            //}
+        }
+
+        void TestUR()
+        {
+            string id = "10";
+            string location = "1";
+            if(SelectedDevice == DeviceType.FTIR.ToString())
+            {
+                location = "2";
+            }
+            else if (SelectedDevice == DeviceType.ColorMeter.ToString())
+            {
+                location = "3";
+            }
+            else if (SelectedDevice == DeviceType.AccuFluo.ToString())
+            {
+                location = "4";
+            }
+            else if (SelectedDevice == DeviceType.DPL.ToString())
+            {
+                location = "5";
+            }
+            else if (SelectedDevice == DeviceType.Pickup2.ToString())
+            {
+                location = "6";
+            }
+
+            string op = "1";
+            if (!IsPickupOp)
+            {
+                op = "2";
+            }
+
+            string command = id + location + op + location;
+
+            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+            if (!robot.Send(command))
+            {
+                MessageBox.Show("Failed sending command: " + command, "Error");
+            }
+        }
+
+        void StartProcess()
+        {
+            string controlNum = "";
+            var dialogControlNumberWindow = new View.StoneData();
+            var dialogViewModel = new StoneDataViewModel();
+            dialogControlNumberWindow.DataContext = dialogViewModel;
+            bool? dialogResult = dialogControlNumberWindow.ShowDialog();
+            if (dialogResult == true)
+            {
+                controlNum = dialogViewModel.ControlNumber;
+            }
+            else
+                return;
+
+            if (usingThreadPool)
+            {
+                processing = true;
+                count++;
+                //ProcessStatus v = new ProcessStatus(count);
+                // adding control number for stone save function
+                ProcessStatus v = new ProcessStatus(count, controlNum);
+                workQueue.Enqueue(v);
+            }
+            else
+            {
+                processing = true;
+                count++;
+                ProcessStatus processStatus = new ProcessStatus(count, ProcessEvent);
+                processStatusList.Add(processStatus);
+
+                BackgroundWorker bw = new BackgroundWorker();
+                bw.DoWork += new DoWorkEventHandler(StartProcessEx);
+                bw.RunWorkerCompleted += new RunWorkerCompletedEventHandler(ProcessCompleted);
+                bw.RunWorkerAsync(processStatus);
+            }
+        }
+
+        void StartProcessEx(object sender, DoWorkEventArgs e) 
+        {
+            ProcessStatus procStatus = (ProcessStatus)e.Argument;
+            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+            DeviceManager dm = null;
+            e.Result = true;
+
+            int timeout = 60 * 1000; // 3 minutes
+            string msg;
+            for (int i = 0; i < (int)DeviceType.URobot; i++)
+            {
+                dm = DeviceManagers[i];
+
+                // 0. prepare stone
+                {
+                    procStatus.processEvent.Reset();
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "pick up stone");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    if (!robot.Send("pickup1"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in sending pickup1")));
+                        e.Result = false;
+                        return;
+                    }
+                    if (!procStatus.processEvent.WaitOne(timeout))
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "pickup1 timeout");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                    else
+                    {
+                        // todo: check pickedUp
+                        if (!procStatus.pickedUp)
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive pickedUp status");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            e.Result = false;
+                            return;
+                        }
+                    }
+                }
+
+                if (procStatus.dropped)
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+
+                // 1. move stone
+                {
+                    procStatus.processEvent.Reset();
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "move stone");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    if (!robot.Send("ack")) // change to move later
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to move stone")));
+                        e.Result = false;
+                        return;
+                    }
+                    if (!procStatus.processEvent.WaitOne(timeout))
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "readyCV timeout");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                    else
+                    {
+                        //Thread.Sleep(50);
+                        //todo: check readyCV
+                        if (procStatus.readyCV)
+                        {
+                            if (!robot.Send("ack"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to readyCV")));
+                                e.Result = false;
+                                return;
+                            }
+                            
+                        } else
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive readyCV status");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            e.Result = false;
+                            return;
+                        }
+                    }
+                }
+
+                if (procStatus.dropped)
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+
+                // 1.5 drop stone
+                {
+                    procStatus.processEvent.Reset();
+                    if (dm.IsDeviceReady())
+                    {
+                        Thread.Sleep(2000);
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "load stone");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        if (!robot.Send("loadCV"))
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send loadCV")));
+                            e.Result = false;
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "not ready");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                    if (!procStatus.processEvent.WaitOne(timeout))
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "load stone timeout");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                    else
+                    {
+                        // todo: check stoneOnCV
+                        if (procStatus.stoneOnCV)
+                        {
+                            if (!robot.Send("ack"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to stoneOnCV")));
+                                e.Result = false;
+                                return;
+                            }
+                        } else
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive stoneOnCV status");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            e.Result = false;
+                            return;
+                        }
+                    }
+                }
+
+                if (procStatus.dropped)
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+
+                // 2. calibrate device
+                {
+                    procStatus.processEvent.Reset();
+                    if (dm.NeedCalibration())
+                    {
+                        // pick up stone
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "pick up stone");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        if (!robot.Send("repeatCV"))
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send repeatCV")));
+                            e.Result = false;
+                            return;
+                        }
+                        if (!procStatus.processEvent.WaitOne(timeout))
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "calibrating pick up stone timeout");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            e.Result = false;
+                            return;
+                        }
+                        else
+                        {
+                            // todo: check removedCV
+                            if (!robot.Send("ack"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to removedCV")));
+                                e.Result = false;
+                                return;
+                            }
+                        }
+
+                        // calibrate device
+                        do
+                        {
+                            msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "calibrating");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            procStatus.processEvent.Reset();
+                            dm.CalibrateEx();
+                            procStatus.processEvent.WaitOne();
+                            Thread.Sleep(5000);
+                        } while (dm.NeedCalibration());
+
+                        // put back stone
+                        if (dm.IsDeviceReady())
+                        {
+                            procStatus.processEvent.Reset();
+                            msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "put stone");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            if (!robot.Send("loadCV"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send loadCV again")));
+                                e.Result = false;
+                                return;
+                            }
+                            if (!procStatus.processEvent.WaitOne(timeout))
+                            {
+                                msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "put stone timeout");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                e.Result = false;
+                                return;
+                            }
+                            else
+                            {
+                                // todo: check stoneOnCV
+                                if (!robot.Send("ack"))
+                                {
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to stoneOnCV")));
+                                    e.Result = false;
+                                    return;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "not ready");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            e.Result = false;
+                            return;
+                        }
+                    }
+                }
+
+                if (procStatus.dropped)
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+
+                // 3. measure stone
+                {
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "measuring");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    procStatus.processEvent.Reset();
+                    dm.MeasureEx();
+                    if (!procStatus.processEvent.WaitOne(timeout))
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "measuring timeout");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                }
+            }
+
+            Thread.Sleep(5000);
+            // 4. finished process
+            if (dm.IsDeviceReady())
+            {
+                msg = string.Format("{0}", "finish process");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+
+                procStatus.processEvent.Reset();
+                if (!robot.Send("doneCV"))
+                {
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("failed to send doneCV")));
+                    e.Result = false;
+                    return;
+                }
+                if (!procStatus.processEvent.WaitOne(timeout))
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)((int)DeviceType.URobot - 1)).ToString(), "put back stone timeout");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+                else
+                {
+                    // todo: check removedCV
+                    if (procStatus.removedCV)
+                    {
+                        if (!robot.Send("ack"))
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to stoneOnCV")));
+                            e.Result = false;
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        msg = string.Format("Error: {0}", "did not receive removedCV status");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                }
+            }
+            else
+            {
+                msg = string.Format("{0}", "device not ready for pickup the stone to finish the process");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                e.Result = false;
+                return;
+            }
+
+            if (procStatus.dropped)
+            {
+                msg = string.Format("Error: {0}", "stone dropped");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                e.Result = false;
+                return;
+            }
+        }
+
+        void ProcessCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            processing = false;
+            Application.Current.Dispatcher.BeginInvoke(new Action(CommandManager.InvalidateRequerySuggested));
+            if ((bool)e.Result == true)
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process completed")));
+            } else
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+            }
+        }
+
+        void StartProcessEx(WorkArg workArg)
+        {
+            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+            DeviceManager dm = null;
+
+            ProcessStatus procStatus = workArg.procStatus;
+            ManualResetEvent processEvent = workArg.processEvent;
+            string processID = workArg.threadName;
+
+            int timeout = 60 * 1000; // 3 minutes
+            string msg;
+            for (int i = 0; i < (int)DeviceType.URobot; i++)
+            {
+                dm = DeviceManagers[i];
+                DeviceStatus ds = deviceStatusList[i];
+                
+                // need to change when thread numbers are more than 2
+                while (ds.status == Status.Busy)
+                {
+                    Thread.Sleep(2000);
+                }
+
+                ds.status = Status.Busy;
+                ds.procID = processID;
+
+                dm.InitialStone(procStatus.controlNum);
+
+                try
+                {
+                    // 0. prepare stone
+                    {
+                        processEvent.Reset();
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "pick up stone");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        if (!robot.Send("pickup1"))
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in sending pickup1")));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception("Error: failed in sending pickup1");
+                        }
+                        if (!processEvent.WaitOne(timeout))
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "pickup1 timeout");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception(msg);
+                        }
+                        else
+                        {
+                            // todo: check pickedUp
+                            if (!procStatus.pickedUp)
+                            {
+                                msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive pickedUp status");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception(msg);
+                            }
+                        }
+                    }
+
+                    if (procStatus.dropped)
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                        throw new Exception(msg);
+                    }
+
+                    // 1. move stone
+                    {
+                        processEvent.Reset();
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "move stone");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        if (!robot.Send("ack")) // change to move later
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to move stone")));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception("Error: failed to ack to move stone");
+                        }
+                        if (!processEvent.WaitOne(timeout))
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "readyCV timeout");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception(msg);
+                        }
+                        else
+                        {
+                            //Thread.Sleep(50);
+                            //todo: check readyCV
+                            if (procStatus.readyCV)
+                            {
+                                if (!robot.Send("ack"))
+                                {
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to readyCV")));
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                    throw new Exception("Error: failed to ack to readyCV");
+                                }
+
+                            }
+                            else
+                            {
+                                msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive readyCV status");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception(msg);
+                            }
+                        }
+                    }
+
+                    if (procStatus.dropped)
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                        throw new Exception(msg);
+                    }
+
+                    // 1.5 drop stone
+                    {
+                        processEvent.Reset();
+                        if (dm.IsDeviceReady())
+                        {
+                            Thread.Sleep(2000);
+                            msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "load stone");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            if (!robot.Send("loadCV"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send loadCV")));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception("Error: failed to send loadCV");
+                            }
+                        }
+                        else
+                        {
+                            msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "not ready");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception(msg);
+                        }
+                        if (!processEvent.WaitOne(timeout))
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "load stone timeout");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception(msg);
+                        }
+                        else
+                        {
+                            if (procStatus.stoneOnCV)
+                            {
+                                if (!robot.Send("ack"))
+                                {
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to stoneOnCV")));
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                    throw new Exception("Error: failed to ack to stoneOnCV");
+                                }
+                            }
+                            else
+                            {
+                                msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive stoneOnCV status");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception(msg);
+                            }
+                        }
+                    }
+
+                    if (procStatus.dropped)
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                        throw new Exception(msg);
+                    }
+
+                    // 2. calibrate device
+                    {
+                        processEvent.Reset();
+                        if (dm.NeedCalibration())
+                        {
+                            // pick up stone
+                            msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "pick up stone");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            if (!robot.Send("repeatCV"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send repeatCV")));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception("Error: failed to send repeatCV");
+                            }
+                            if (!processEvent.WaitOne(timeout))
+                            {
+                                msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "calibrating pick up stone timeout");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception(msg);
+                            }
+                            else
+                            {
+                                if (procStatus.removedCV)
+                                {
+                                    if (!robot.Send("ack"))
+                                    {
+                                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to removedCV")));
+                                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                        throw new Exception("Error: failed to ack to removedCV");
+                                    }
+                                }
+                                else
+                                { 
+                                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "did not receive removedCV status");
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                    throw new Exception(msg);
+                                }
+                            }
+
+                            // calibrate device
+                            do
+                            {
+                                msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "calibrating");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                processEvent.Reset();
+                                dm.CalibrateEx();
+                                processEvent.WaitOne();
+                                Thread.Sleep(5000);
+                            } while (dm.NeedCalibration());
+
+                            // put back stone
+                            if (dm.IsDeviceReady())
+                            {
+                                processEvent.Reset();
+                                msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "put stone");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                if (!robot.Send("loadCV"))
+                                {
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send loadCV again")));
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                    throw new Exception("Error: failed to send loadCV again");
+                                }
+                                if (!processEvent.WaitOne(timeout))
+                                {
+                                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "put stone timeout");
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                    throw new Exception(msg);
+                                }
+                                else
+                                {
+                                    // todo: check stoneOnCV
+                                    if (!robot.Send("ack"))
+                                    {
+                                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to stoneOnCV")));
+                                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                        throw new Exception("Error: failed to ack to stoneOnCV");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "not ready");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception(msg);
+                            }
+                        }
+                    }
+
+                    if (procStatus.dropped)
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "stone dropped");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                        throw new Exception(msg);
+                    }
+
+                    // 3. measure stone
+                    {
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "measuring");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        processEvent.Reset();
+                        dm.MeasureEx();
+                        if (!processEvent.WaitOne(timeout))
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "measuring timeout");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception(msg);
+                        }
+                    }
+
+                    // 3.5 remove stone from device
+                    {
+                        Thread.Sleep(5000);
+                        if (dm.IsDeviceReady())
+                        {
+                            msg = string.Format("{0}", "finish measurement");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+
+                            processEvent.Reset();
+                            if (!robot.Send("doneCV"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to send doneCV")));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception("Error: failed to send doneCV");
+                            }
+                            if (!processEvent.WaitOne(timeout))
+                            {
+                                msg = string.Format("Error: {0}, {1}", ((DeviceType)((int)DeviceType.URobot - 1)).ToString(), "put back stone timeout");
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                                throw new Exception(msg);
+                            }
+                        }
+                        else
+                        {
+                            msg = string.Format("{0}", "device not ready for pickup the stone to finish the process");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                            throw new Exception(msg);
+                        }
+                    }
+
+                    ds.status = Status.Ready;
+                    ds.procID = null;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                    ds.status = Status.Ready;
+                    ds.procID = null;
+                    return;
+                }
+            }
+  
+            // 4. finished process
+            {
+                // put stone back to initial stage
+                // todo: check removedCV
+                if (procStatus.removedCV)
+                {
+                    if (!robot.Send("ack"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to stoneOnCV")));
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                        return;
+                    }
+                }
+                else
+                {
+                    msg = string.Format("Error: {0}", "did not receive removedCV status");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                    return;
+                }
+            }
+   
+
+            if (procStatus.dropped)
+            {
+                msg = string.Format("Error: {0}", "stone dropped");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+                return;
+            }
+
+            // finally
+            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process completed")));
+
+        }
+
+        public void StartWorker(object o)
+        {
+            WorkArg workArg = (WorkArg)o;
+            while (true)
+            {
+                // dequeue to get the job
+                ProcessStatus v = workQueue.Dequeue();
+                workArg.procStatus = v;
+                // Process a task.
+                if (v != null)
+                {
+                    // process the job
+                    Console.WriteLine("Process worker: ");
+                    StartProcessEx(workArg);
+                } else
+                {
+                    workQueue.queueEvent.WaitOne();
+                }
+
+                // Ending condition:
+                if (workArg.EvEnd)
+                {
+                    break;
+                }
+            }
+        }
+
+        void ImageReceivedHandler(ImageReceived image)
+        {
+            if(image.device == DeviceType.ColorMeter.ToString())
+            {
+                GColorImage = image.image;
+            } else if (image.device == DeviceType.URobot.ToString())
+            {
+                URobotImage = image.image;
+            } else if (image.device == DeviceType.AccuFluo.ToString())
+            {
+                GUVImage = image.image;
+            }
+        }
+
+        public void OnEvent(DeviceEvent e)
+        {
+            // event process
+            if (e.device == DeviceType.ColorMeter.ToString())
+            {
+                ProcessGColorEvent((GColorEvent)e.result);
+            }
+            else if (e.device == DeviceType.URobot.ToString())
+            {
+                ProcessURobotEvent((URobotEvent)e.result);
+            }
+            else if (e.device == DeviceType.AccuFluo.ToString())
+            {
+                ProcessGUVEvent((GUVEvent)e.result);
+            }
+            else if (e.device == DeviceType.DPL.ToString())
+            {
+                ProcessDPLEvent((DPLEvent)e.result);
+            }
+        }
+
+        void ProcessURobotEvent(URobotEvent ure)
+        {
+            if (ure.id != null && ure.id == "Client")
+            {
+                if (ure.eventType == EventType.Status)
+                {
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host status: " + ure.message)));
+                    if (ure.message == "Connected")
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host connected")));
+                        // start the UR Host power on initialization
+                        UREvent.Reset();
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Initial robot host")));
+                    }
+                    else if(ure.message == "Disconnected")
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host disconnected")));
+                        UREvent.Reset();
+                    }
+                    else if (ure.message.ToLower().Contains("powering on"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host powering on")));
+                        urHostStatus.poweringon = true;
+                    }
+                    else if (ure.message.ToLower().Contains("idle"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host idle")));
+                        urHostStatus.idle = true;
+                    }
+                    else if (ure.message.ToLower().Contains("loading program"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host loading program")));
+                        urHostStatus.loadingprogram = true;
+                    }
+                    else if (ure.message.ToLower().Contains("brake releasing"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host brake releasing")));
+                        urHostStatus.brakereleasing = true;
+                    }
+                    else if (ure.message.ToLower().Contains("running"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host running")));
+                        urHostStatus.running = true;
+                    }
+                    else if (ure.message.ToLower().Contains("starting program"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host starting program")));
+                        urHostStatus.startingprogram = true;
+                    }
+                    else if (ure.message.ToLower().Contains("powering off"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host powering off")));
+                        urHostStatus.poweringoff = true;
+                    }
+                    else if (ure.message.ToLower().Contains("power_off"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host power_off")));
+                        urHostStatus.poweroff = true;
+                    }
+
+                }
+                else if(ure.eventType == EventType.Error)
+                {
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot host error: " + ure.message)));
+                }
+            }
+            else
+            {
+                ProcessStatus procStatus = null;
+                if (usingThreadPool)
+                {
+                    if (processing)
+                    {
+                        procStatus = threadPool.WorkArgs[int.Parse(ure.id)].procStatus;
+                        procStatus.processEvent = threadPool.WorkArgs[int.Parse(ure.id)].processEvent;
+                    }
+                }
+                else
+                {
+                    if (processing)
+                    {
+                        procStatus = processStatusList[count - 1];
+                    }
+                }
+                if (ure.eventType == EventType.Result)
+                {
+                    if (ure.message == "Command")
+                    {
+                        URobotResult uRes = (URobotResult)ure.result;
+                        if (uRes.Command == "Measure")
+                        {
+                            DeviceManagers[(int)DeviceType.ColorMeter].MeasureEx();
+                        }
+                        else if (uRes.Command == "Calibrate")
+                        {
+                            DeviceManagers[(int)DeviceType.ColorMeter].CalibrateEx();
+                        }
+                        else
+                        {
+                            Console.WriteLine("ProcessURobotEvent: Unknow command");
+                            return;
+                        }
+                    }
+                    else if (ure.message == "Status")
+                    {
+                        URobotResult uRes = (URobotResult)ure.result;
+                        if (uRes.Command == "Connected")
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot connected")));
+                        }
+                        else if (uRes.Command == "Disconnected")
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot disconnected")));
+                        }
+                    }
+                }
+                else if (ure.eventType == EventType.Error)
+                {
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot error: " + ure.message)));
+                    if (processing)
+                    {
+                        procStatus.error = true;
+                        procStatus.processEvent.Set();
+                    }
+                }
+                else if (ure.eventType == EventType.Status)
+                {
+                    if (processing)
+                    {
+                        if (ure.message == "Ready")
+                        {
+                            procStatus.processEvent.Set();
+                        }
+                        else if (ure.message == "pickedUp")
+                        {
+                            if (!procStatus.pickedUp)
+                            {
+                                procStatus.pickedUp = true;
+                                procStatus.processEvent.Set();
+                            }
+                        }
+                        else if (ure.message == "dropped")
+                        {
+                            procStatus.processEvent.Set();
+                        }
+                        else if (ure.message == "readyCV")
+                        {
+                            if (!procStatus.readyCV)
+                            {
+                                procStatus.readyCV = true;
+                                procStatus.processEvent.Set();
+                            }
+                            else
+                            {
+                                if (!DeviceManagers[(int)DeviceType.URobot].Send("ack"))
+                                {
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to readyCV")));
+                                }
+                            }
+                        }
+                        else if (ure.message == "stoneOnCV")
+                        {
+                            if (!procStatus.stoneOnCV)
+                            {
+                                procStatus.stoneOnCV = true;
+                                procStatus.removedCV = false;
+                                procStatus.processEvent.Set();
+                            }
+                        }
+                        else if (ure.message == "removedCV")
+                        {
+                            if (!procStatus.removedCV)
+                            {
+                                procStatus.removedCV = true;
+                                procStatus.stoneOnCV = false;
+                                procStatus.processEvent.Set();
+                            }
+                            else
+                            {
+                                if (!DeviceManagers[(int)DeviceType.URobot].Send("ack"))
+                                {
+                                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack to readyCV")));
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (ure.message == "robot_ready")
+                        {
+                            Console.WriteLine("Robot ready!!!");
+                            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+                            if (!robot.Send("ack"))
+                            {
+                                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed to ack " + ure.message)));
+                            }
+                        }
+                    }
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot status: " + ure.message)));
+                }
+            }
+        }
+
+        void ProcessGColorEvent(GColorEvent e)
+        {
+            ProcessStatus procStatus = null;
+            if (usingThreadPool)
+            {
+                if (processing)
+                {
+                    int index = int.Parse(deviceStatusList[(int)DeviceType.ColorMeter].procID);
+                    procStatus = threadPool.WorkArgs[index].procStatus;
+                    procStatus.processEvent = threadPool.WorkArgs[index].processEvent;
+                }
+            }
+            else
+            {
+                if (processing)
+                {
+                    procStatus = processStatusList[count - 1];
+                }
+            }
+            if (e.eventType == EventType.Info)
+            {
+                if (processing)
+                {
+                    if (e.message == "Calibration Complete!")
+                    {
+                        procStatus.processEvent.Set();
+                    } else if (e.message.Contains("Measurement Complete!"))
+                    {
+                        procStatus.processEvent.Set();
+                    }
+                }
+            } else if (e.eventType == EventType.Error)
+            {
+                if (processing)
+                {
+                    if(e.message.Contains("Check dust on stage"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    } else if(e.message.Contains("Brightness is low"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("calibration failed"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    } else if(e.message.ToLower().Contains("check light stability"))
+                    {
+                        MessageBox.Show("check light stability", "Warning");
+                        procStatus.processEvent.Set();
+                    }else if(e.message.ToLower().Contains("motor connection error"))
+                    {
+                        MessageBox.Show("Motor connection error", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("error processing stone"))
+                    {
+                        MessageBox.Show("Error processing stone", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("measurement cancelled by user"))
+                    {
+                        MessageBox.Show("Measurement cancelled", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("measure exception"))
+                    {
+                        MessageBox.Show("Measure Exception", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("check diamond position"))
+                    {
+                        MessageBox.Show("Check diamond position", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("image processing error"))
+                    {
+                        MessageBox.Show("Image processing error", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if(e.message.ToLower().Contains("measure again: process failure"))
+                    {
+                        MessageBox.Show("Measure again: process failure", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                }
+            } else if (e.eventType == EventType.Status)
+            {
+
+            } else if(e.eventType == EventType.Result)
+            {
+
+            }
+
+            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(e.message)));
+        }
+
+        void ProcessGUVEvent(GUVEvent e)
+        {
+            ProcessStatus procStatus = null;
+            if (usingThreadPool)
+            {
+                if (processing)
+                {
+                    int index = int.Parse(deviceStatusList[(int)DeviceType.AccuFluo].procID);
+                    procStatus = threadPool.WorkArgs[index].procStatus;
+                    procStatus.processEvent = threadPool.WorkArgs[index].processEvent;
+                }
+            }
+            else
+            {
+                if (processing)
+                {
+                    procStatus = processStatusList[count - 1];
+                }
+            }
+
+            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(e.message)));
+
+            if (e.eventType == EventType.Info)
+            {
+                if (processing)
+                {
+                    if (e.message == "Calibration Complete!")
+                    {
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.Contains("Measurement Complete!"))
+                    {
+                        procStatus.processEvent.Set();
+                    }
+                }
+            }
+            else if (e.eventType == EventType.Error)
+            {
+                if (processing)
+                {
+                    if (e.message.Contains("Check dust on stage"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.Contains("Brightness is low"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("calibration failed"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("check light stability"))
+                    {
+                        MessageBox.Show("check light stability", "Warning");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("motor connection error"))
+                    {
+                        MessageBox.Show("Motor connection error", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("error processing stone"))
+                    {
+                        MessageBox.Show("Error processing stone", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("measurement cancelled by user"))
+                    {
+                        MessageBox.Show("Measurement cancelled", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("measure exception"))
+                    {
+                        MessageBox.Show("Measure Exception", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("check diamond position"))
+                    {
+                        MessageBox.Show("Check diamond position", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("image processing error"))
+                    {
+                        MessageBox.Show("Image processing error", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("measure again: process failure"))
+                    {
+                        MessageBox.Show("Measure again: process failure", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                }
+            }
+            else if (e.eventType == EventType.Status)
+            {
+
+            }
+            else if (e.eventType == EventType.Result)
+            {
+
+            }
+        }
+
+        void ProcessDPLEvent(DPLEvent e)
+        {
+            ProcessStatus procStatus = null;
+            if (usingThreadPool)
+            {
+                if (processing)
+                {
+                    int index = int.Parse(deviceStatusList[(int)DeviceType.DPL].procID);
+                    procStatus = threadPool.WorkArgs[index].procStatus;
+                    procStatus.processEvent = threadPool.WorkArgs[index].processEvent;
+                }
+            }
+            else
+            {
+                if (processing)
+                {
+                    procStatus = processStatusList[count - 1];
+                }
+            }
+
+            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(e.message)));
+
+            if (e.eventType == EventType.Info)
+            {
+                if (processing)
+                {
+                    if (e.message == "Calibration Complete!")
+                    {
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.Contains("Measurement Complete!"))
+                    {
+                        procStatus.processEvent.Set();
+                    }
+                }
+            }
+            else if (e.eventType == EventType.Error)
+            {
+                if (processing)
+                {
+                    if (e.message.Contains("Check dust on stage"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.Contains("Brightness is low"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("calibration failed"))
+                    {
+                        MessageBox.Show(e.message, "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("check light stability"))
+                    {
+                        MessageBox.Show("check light stability", "Warning");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("motor connection error"))
+                    {
+                        MessageBox.Show("Motor connection error", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("error processing stone"))
+                    {
+                        MessageBox.Show("Error processing stone", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("measurement cancelled by user"))
+                    {
+                        MessageBox.Show("Measurement cancelled", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("measure exception"))
+                    {
+                        MessageBox.Show("Measure Exception", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("check diamond position"))
+                    {
+                        MessageBox.Show("Check diamond position", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("image processing error"))
+                    {
+                        MessageBox.Show("Image processing error", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                    else if (e.message.ToLower().Contains("measure again: process failure"))
+                    {
+                        MessageBox.Show("Measure again: process failure", "Error");
+                        procStatus.processEvent.Set();
+                    }
+                }
+            }
+            else if (e.eventType == EventType.Status)
+            {
+
+            }
+            else if (e.eventType == EventType.Result)
+            {
+
+            }
+        }
+
+        void StartUR()
+        {
+            int timeout = 60 * 1000;
+            UREvent.Reset();
+            UREvent.WaitOne();
+            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+
+            // 1. power on
+            string msg = "power on";
+            robot.Send(msg, true);
+            if(!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in power on")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "power on timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.poweringon)
+                {
+                    msg = string.Format("Error: {0}", "did not receive powering on response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+
+            // 2. robotmode
+            msg = "robotmode";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in robotmode")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "robotmode timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.idle)
+                {
+                    msg = string.Format("Error: {0}", "did not receive idle response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+
+            //3. load diamond.urp
+            msg = "load\"diamond.urp\"";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in load diamond.urp")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "load diamond.urp timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.loadingprogram)
+                {
+                    msg = string.Format("Error: {0}", "did not receive loading program response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+
+            // 4. brake release
+            msg = "brake release";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in brake release")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "brake release timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.brakereleasing)
+                {
+                    msg = string.Format("Error: {0}", "did not receive brake release response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+
+            //5. robotmode
+            msg = "robotmode";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in robotmode")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "robotmode timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.running)
+                {
+                    msg = string.Format("Error: {0}", "did not receive running response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+
+            // 6. play
+            msg = "play";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in play")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "play timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.startingprogram)
+                {
+                    msg = string.Format("Error: {0}", "did not receive starting program response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+        }
+
+        public Thread InitialURThread()
+        {
+            urHostStatus = new URHostStatus();
+            var t = new Thread(() => StartUR());
+            t.Start();
+            return t;
+        }
+
+        void StopUR()
+        {
+            int timeout = 60 * 1000;
+            UREvent.Reset();
+            UREvent.WaitOne();
+            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+
+            // 1. power off
+            string msg = "power off";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in power off")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "power off timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.poweringoff)
+                {
+                    msg = string.Format("Error: {0}", "did not receive powering off response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+
+            //2. robotmode
+            msg = "robotmode";
+            robot.Send(msg, true);
+            if (!UREvent.WaitOne())
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: failed in robotmode")));
+                return;
+            }
+            if (!UREvent.WaitOne(timeout))
+            {
+                msg = string.Format("Error: {0}, {1}", DeviceType.URobot.ToString(), "robotmode timeout");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                return;
+            }
+            else
+            {
+                if (!urHostStatus.poweroff)
+                {
+                    msg = string.Format("Error: {0}", "did not receive power off response");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    return;
+                }
+            }
+        }
+
+        #region dispose
+        private bool _disposed = false;
+
+        protected override void OnDispose()
+        {
+            Dispose(true);
+            
+            for(int i = 0; i < DeviceManagers.Count; i++)
+            {
+                DeviceManager dm = DeviceManagers[i];
+                dm.DisconnectEx();
+            }
+
+            if (usingThreadPool)
+            {
+                threadPool.End();
+                threadPool.Join();
+            }
+
+            urThread.Join();
+
+            GC.SuppressFinalize(this);
+        }
+
+        void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    //
+                }
+                _disposed = true;
+            }
+        }
+        #endregion
+    }
+}

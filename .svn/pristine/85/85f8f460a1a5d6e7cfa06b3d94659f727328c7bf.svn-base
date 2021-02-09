@@ -1,0 +1,434 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UtilsLib;
+using gColorLib;
+using ViewModelLib;
+using System.Windows;
+using System.Windows.Media.Imaging;
+using System.Threading;
+using System.Collections.ObjectModel;
+using AutoGrading.Model;
+using System.Net.Sockets;
+using System.ComponentModel;
+
+namespace AutoGrading.ViewModel
+{
+    enum DeviceType
+    {
+        ColorMeter =0,
+        //AccuFlor,
+        //DPL,
+        URobot,
+        Size
+    };
+
+    public class ControlViewModel : ViewModelLib.ViewModelBase
+    {
+        List<DeviceManager> DeviceManagers = new List<DeviceManager>();
+
+        public LogEntryViewModel LogEntryVM { get { return App.LogEntry; } }
+
+        public RelayCommand CommandConnectAll { get; set; }
+        public RelayCommand CommandStageSettings { get; set; }
+        public RelayCommand CommandCalibrateAll { get; set; }
+        public RelayCommand CommandMeasureAll { get; set; }
+        public RelayCommand CommandStartProcess { get; set; }
+
+        ManualResetEvent ProcessEvent = new ManualResetEvent(false);
+        
+        public ObservableCollection<string> Devices { get; set; }
+        public Stone Cassette { get; set; }
+        bool processing = false;
+
+        public ControlViewModel()
+        {
+            EventBus.Instance.Register(this);
+            Devices = new ObservableCollection<string>();
+            for(int i = 0; i < (int)DeviceType.Size; i++)
+            {
+                if(((DeviceType)i).ToString() == "ColorMeter")
+                {
+                    gColorManager manager = new gColorManager("ColorMeter");
+                    DeviceManagers.Add(manager);
+                    manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+                if (((DeviceType)i).ToString() == "URobot")
+                {
+                    URobotManager manager = new URobotManager("URobot");
+                    DeviceManagers.Add(manager);
+                    manager.AddImageReceivedEventSubscriber(ImageReceivedHandler);
+                    Devices.Add(manager.DeviceName);
+                }
+            }
+
+            CommandConnectAll = new RelayCommand(param => ConnectAll());
+            CommandStageSettings = new RelayCommand(param => StageSettings());
+            CommandCalibrateAll = new RelayCommand(param => CalibrateAll());
+            CommandMeasureAll = new RelayCommand(param => MeasureAll());
+            CommandStartProcess = new RelayCommand(param => StartProcess());
+        }
+
+        BitmapSource _gColorImage;
+        public BitmapSource GColorImage
+        {
+            get { return _gColorImage; }
+            set
+            {
+                _gColorImage = value;
+                OnPropertyChanged("GColorImage");
+            }
+        }
+
+        BitmapSource _uRobotImage;
+        public BitmapSource URobotImage
+        {
+            get { return _uRobotImage; }
+            set
+            {
+                _uRobotImage = value;
+                OnPropertyChanged("URobotImage");
+            }
+        }
+
+        public void ConnectingDevices()
+        {
+
+        }
+
+        void ConnectAll()
+        {
+            for(int i = 0; i < DeviceManagers.Count; i++)
+            {
+                DeviceManager dm = DeviceManagers[i];
+                dm.ConnectEx();
+            }
+        }
+
+        void StageSettings()
+        {
+
+        }
+
+        void CalibrateAll()
+        {
+            for (int i = 0; i < DeviceManagers.Count; i++)
+            {
+                DeviceManager dm = DeviceManagers[i];
+                dm.CalibrateEx();
+            }
+        }
+
+        void MeasureAll()
+        {
+            //for (int i = 0; i < DeviceManagers.Count; i++)
+            //{
+            //    ProcessEvent.Reset();
+            //    DeviceManager dm = DeviceManagers[i];
+            //    dm.MeasureEx();
+            //    //ProcessEvent.WaitOne();
+            //}
+        }
+
+        void StartProcess()
+        {
+            processing = true;
+            var dialogControlNumberWindow = new View.StoneData();
+            var dialogViewModel = new StoneDataViewModel();
+            dialogControlNumberWindow.DataContext = dialogViewModel;
+            bool? dialogResult = dialogControlNumberWindow.ShowDialog();
+            if (dialogResult == true)
+            {
+                Cassette = dialogViewModel.Cassette;
+                for(int i = 0; i < DeviceManagers.Count; i++)
+                {
+                    DeviceManager dm = DeviceManagers[i];
+                    dm.SetStone(Cassette);
+                }
+            }
+            else
+                return;
+
+            BackgroundWorker bw = new BackgroundWorker();
+            bw.DoWork += new DoWorkEventHandler(StartProcessEx);
+            bw.RunWorkerCompleted += new RunWorkerCompletedEventHandler(ProcessCompleted);
+            bw.RunWorkerAsync();
+        }
+
+        void StartProcessEx(object sender, DoWorkEventArgs e) 
+        {
+            DeviceManager robot = DeviceManagers[(int)DeviceType.URobot];
+            DeviceManager dm = null;
+            e.Result = true;
+
+            int timeout = 180 * 1000; // 3 minutes
+            string msg;
+            for (int i = 0; i < (int)DeviceType.URobot; i++)
+            {
+                // prepare stone
+                ProcessEvent.Reset();
+                dm = DeviceManagers[i];
+                
+                if (dm.IsDeviceReady())
+                {
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "put stone");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    if (!robot.Send("start"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: Robot failed to start robot")));
+                        e.Result = false;
+                        return;
+                    }
+                } else
+                {
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "not ready");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+                if (!ProcessEvent.WaitOne(timeout))
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "put stone timeout");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+
+                // calibrate device
+                if (dm.NeedCalibration())
+                {
+                    // pick up stone
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "pick up stone");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    if (!robot.Send("pickup"))
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: Robot failed to pick up")));
+                        e.Result = false;
+                        return;
+                    }
+                    if (!ProcessEvent.WaitOne(timeout))
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "calibrating pick up stone timeout");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+
+                    // calibrate device
+                    msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "calibrating");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    ProcessEvent.Reset();
+                    dm.CalibrateEx();
+                    if (!ProcessEvent.WaitOne(timeout))
+                    {
+                        msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "calibrating timeout");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+
+                    // put back stone
+                    if (dm.IsDeviceReady())
+                    {
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "put stone");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        if (!robot.Send("put"))
+                        {
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Error: Robot failed to put stone")));
+                            e.Result = false;
+                            return;
+                        }
+                        if (!ProcessEvent.WaitOne(timeout))
+                        {
+                            msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "put stone timeout");
+                            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                            e.Result = false;
+                            return;
+                        }
+                    } else
+                    {
+                        msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "not ready");
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                        e.Result = false;
+                        return;
+                    }
+                }
+
+                // measure stone
+                msg = string.Format("{0}, {1}", ((DeviceType)i).ToString(), "measuring");
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                ProcessEvent.Reset();
+                dm.MeasureEx();
+                if (!ProcessEvent.WaitOne(timeout))
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)i).ToString(), "measuring timeout");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+            }
+            if (dm.IsDeviceReady())
+            {
+                if (!robot.Send("finish"))
+                {
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot: failed to pick up stone and put back on stage")));
+                }
+                if (!ProcessEvent.WaitOne(timeout))
+                {
+                    msg = string.Format("Error: {0}, {1}", ((DeviceType)((int)DeviceType.URobot-1)).ToString(), "put back stone timeout");
+                    Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(msg)));
+                    e.Result = false;
+                    return;
+                }
+            }
+
+        }
+
+        void ProcessCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            processing = false;
+            if((bool)e.Result == true)
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process completed")));
+            } else
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Process failed")));
+            }
+        }
+
+        void ImageReceivedHandler(ImageReceived image)
+        {
+            if(image.device == DeviceType.ColorMeter.ToString())
+            {
+                GColorImage = image.image;
+            } else if (image.device == DeviceType.URobot.ToString())
+            {
+                GColorImage = image.image;
+            }
+        }
+
+        public void OnEvent(DeviceEvent e)
+        {
+            // event process
+            if (e.device == DeviceType.ColorMeter.ToString())
+            {
+                ProcessGColorEvent((GColorEvent)e.result);
+            }
+            else if (e.device == DeviceType.URobot.ToString())
+            {
+                ProcessURobotEvent((URobotEvent)e.result);
+            }
+        }
+
+        void ProcessURobotEvent(URobotEvent ure)
+        {
+            if (ure.eventType == EventType.Result)
+            {
+                if (ure.message == "Command")
+                {
+                    URobotResult uRes = (URobotResult)ure.result;
+                    if (uRes.Command == "Measure")
+                    {
+                        DeviceManagers[(int)DeviceType.ColorMeter].MeasureEx();
+                    }
+                    else if (uRes.Command == "Calibrate")
+                    {
+                        DeviceManagers[(int)DeviceType.ColorMeter].CalibrateEx();
+                    }
+                    else
+                    {
+                        Console.WriteLine("ProcessURobotEvent: Unknow command");
+                        return;
+                    }
+                }
+                else if (ure.message == "Status")
+                {
+                    URobotResult uRes = (URobotResult)ure.result;
+                    if (uRes.Command == "Connected")
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot connected")));
+                    }
+                    else if (uRes.Command == "Disconnected")
+                    {
+                        Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot disconnected")));
+                    }
+                }
+            }
+            else if (ure.eventType == EventType.Error)
+            {
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot error: " + ure.message)));
+            }
+            else if (ure.eventType == EventType.Status)
+            {
+                if (processing)
+                {
+                    if (ure.message == "Ready")
+                    {
+                        ProcessEvent.Set();
+                    }
+                }
+                Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry("Robot status: " + ure.message)));
+            }
+        }
+
+        void ProcessGColorEvent(GColorEvent e)
+        {
+            if(e.eventType == EventType.Info)
+            {
+                if (processing)
+                {
+                    if (e.message == "Calibration Complete!")
+                    {
+                        ProcessEvent.Set();
+                    } else if (e.message.Contains("Measurement Complete!"))
+                    {
+                        ProcessEvent.Set();
+                    }
+                }
+            } else if (e.eventType == EventType.Error)
+            {
+
+            } else if (e.eventType == EventType.Status)
+            {
+
+            } else if(e.eventType == EventType.Result)
+            {
+
+            }
+
+            Application.Current.Dispatcher.Invoke((Action)(() => LogEntryVM.AddEntry(e.message)));
+        }
+
+        #region dispose
+        private bool _disposed = false;
+
+        protected override void OnDispose()
+        {
+            Dispose(true);
+            
+            for(int i = 0; i < DeviceManagers.Count; i++)
+            {
+                DeviceManager dm = DeviceManagers[i];
+                dm.DisconnectEx();
+            }
+
+            GC.SuppressFinalize(this);
+        }
+
+        void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    //
+                }
+                _disposed = true;
+            }
+        }
+        #endregion
+    }
+}

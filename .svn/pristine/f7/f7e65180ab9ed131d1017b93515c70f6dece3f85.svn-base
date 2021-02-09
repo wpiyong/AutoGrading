@@ -1,0 +1,44 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using ViewModelLib;
+using AutoGrading.Model;
+using UtilsLib;
+using System.Windows;
+using gColorLib;
+using System.Windows.Controls;
+
+namespace AutoGrading.ViewModel
+{
+    class StoneDataViewModel : ViewModelBase
+    {
+        public StoneDataViewModel()
+        {
+            base.DisplayName = "StoneDataViewModel";
+
+            CommandCancel = new RelayCommand(param => this.Close(param));
+            CommandOK = new RelayCommand(param => this.Continue(param));
+        }
+
+        public RelayCommand CommandCancel { get; set; }
+        public RelayCommand CommandOK { get; set; }
+
+        public string ControlNumber { get; private set; }
+
+        void Continue(object param)
+        {
+            if (ControlNumber != null && ControlNumber.Length > 0)
+            {
+                ((Window)param).DialogResult = true;
+                Close(param);
+            }
+        }
+
+        void Close(object param)
+        {
+            ((Window)param).Close();
+        }
+    }
+}

@@ -1,0 +1,9 @@
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\x64\Debug\FTIRLib.dll
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\x64\Debug\FTIRLib.pdb
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\x64\Debug\UtilsLib.dll
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\x64\Debug\UtilsLib.pdb
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\x64\Debug\FTIRLib.csproj.CoreCompileInputs.cache
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\x64\Debug\FTIRLib.csproj.CopyComplete
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\x64\Debug\FTIRLib.dll
+C:\work\AutoGrading\AutoGrading\FTIRLib\obj\x64\Debug\FTIRLib.pdb
+C:\work\AutoGrading\AutoGrading\FTIRLib\bin\x64\Debug\DiamondCheck_Auto.dll

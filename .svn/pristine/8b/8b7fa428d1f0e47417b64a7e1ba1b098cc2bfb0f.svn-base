@@ -1,0 +1,995 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UtilsLib;
+using Gia405ServiceLib;
+using DplLib.Model;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Threading;
+using System.Windows;
+using PeakFinder;
+using System.IO.Pipes;
+using System.IO;
+
+namespace DplLib
+{
+    public class DplManager : DeviceManager
+    {
+        public DplManager(string name)
+        {
+            DeviceName = "DPL";
+
+            DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Ready", null));
+            EventBus.Instance.PostEvent(eb);
+
+            _gia405Service = new Gia405Service();
+            _cover = new Cover(_gia405Service);
+            SpectraVM = new SpectraUtil();
+            try
+            {
+                ServiceProc405 = new Process();
+                ServiceProc405.StartInfo.UseShellExecute = false;
+                ServiceProc405.StartInfo.FileName = @"C:\work\405\dev\service\Gia405WindowsService\Gia405WindowsService\bin\Debug\Gia405WindowsService.exe";
+                ServiceProc405.StartInfo.CreateNoWindow = true;
+
+                if (ServiceProc405.Start())
+                {
+                    eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Gia405Service started", null));
+                    EventBus.Instance.PostEvent(eb);
+
+                    Thread.Sleep(2000);
+
+                    var bw = new BackgroundWorker();
+                    bw.DoWork += ConnectTo405Service;
+                    bw.RunWorkerCompleted += ConnectTo405ServiceComplete;
+                    bw.RunWorkerAsync();
+
+                    eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Trying to connect...", null));
+                    EventBus.Instance.PostEvent(eb);
+                }
+                else
+                {
+                    eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Gia405Service failed", null));
+                    EventBus.Instance.PostEvent(eb);
+                }
+            }
+            catch(Exception ex)
+            {
+                eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Gia405Service failed and DPL connection failed", null));
+                EventBus.Instance.PostEvent(eb);
+            }
+        }
+
+        ~DplManager()
+        {
+            DisconnectEx();
+        }
+
+        public override bool ConnectEx()
+        {
+            return Connected;
+        }
+
+        public override bool CalibrateEx()
+        {
+            return true;
+        }
+
+        public override bool MeasureEx()
+        {
+            Measure(null);
+            return true;
+        }
+
+        public override bool IsDeviceReady()
+        {
+            return _cover.Open();
+        }
+
+        public override bool NeedCalibration()
+        {
+            return false;
+        }
+
+        public override bool DisconnectEx()
+        {
+            DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Gia405Service stopped, DPL disconnected", null));
+            EventBus.Instance.PostEvent(eb);
+            ServiceProc405.Kill();
+
+            return true;
+        }
+
+        public override bool InitialStone(string ctlNum)
+        {
+            ControlNumber = ctlNum;
+            return true;
+        }
+
+        bool _scanning;
+        public bool Scanning
+        {
+            get { return _scanning; }
+            set
+            {
+                _scanning = value;
+                //OnPropertyChanged("Scanning");
+            }
+        }
+
+
+        bool _coverMoving;
+        public bool CoverMoving
+        {
+            get { return _coverMoving; }
+            set
+            {
+                _coverMoving = value;
+                //OnPropertyChanged("CoverMoving");
+            }
+        }
+
+        bool _connected;
+        public bool Connected
+        {
+            get { return _connected; }
+            set
+            {
+                _connected = value;
+                //OnPropertyChanged("Connected");
+            }
+        }
+
+        bool _isControlNumberFocused;
+        public bool IsControlNumberFocused
+        {
+            get { return _isControlNumberFocused; }
+            set
+            {
+                _isControlNumberFocused = value;
+                //OnPropertyChanged("IsControlNumberFocused");
+            }
+        }
+
+        string _controlNumber;
+        public string ControlNumber
+        {
+            get { return _controlNumber; }
+            set
+            {
+                _controlNumber = value;
+                //OnPropertyChanged("ControlNumber");
+            }
+        }
+
+        string _legendContent;
+        public string LegendContent
+        {
+            get { return _legendContent; }
+            set
+            {
+                _legendContent = value;
+                //OnPropertyChanged("LegendContent");
+            }
+        }
+        string _legendDescription;
+        public string LegendDescription
+        {
+            get { return _legendDescription; }
+            set
+            {
+                _legendDescription = value;
+                //OnPropertyChanged("LegendDescription");
+            }
+        }
+
+        bool _resultReady;
+        public bool ResultReady
+        {
+            get { return _resultReady; }
+            set
+            {
+                _resultReady = value;
+                //OnPropertyChanged("ResultReady");
+            }
+        }
+
+        bool _uploading;
+        public bool Uploading
+        {
+            get { return _uploading; }
+            set
+            {
+                _uploading = value;
+                //OnPropertyChanged("Uploading");
+            }
+        }
+
+        //string _deviceName;
+        //public string DeviceName
+        //{
+        //    get { return _deviceName; }
+        //    set
+        //    {
+        //        _deviceName = value;
+        //        //OnPropertyChanged("DeviceName");
+        //    }
+        //}
+
+//        public WindowState CurWindowState
+//        {
+//            get
+//            {
+//#if _DEBUG
+//                return WindowState.Normal;
+//#else
+//                return WindowState.Maximized;
+//#endif
+//            }
+//            set { }
+//        }
+
+
+        //public StatusViewModel StatusVM { get; set; }
+        //public UserViewModel UserVM { get; set; }
+        public SpectraUtil SpectraVM { get; set; }
+
+        //public RelayCommand CommandToggleContinuousScan { get; set; }
+        //public RelayCommand CommandMeasure { get; set; }
+        //public RelayCommand CommandCancelResult { get; set; }
+        //public RelayCommand CommandUpload { get; set; }
+
+        //public RelayCommand CommandOpenCover { get; set; }
+        //public RelayCommand CommandCloseCover { get; set; }
+
+        Process ServiceProc405 = null;
+        Gia405Service _gia405Service;
+        Cover _cover = null;
+
+        //public MainViewModel()
+        //{
+        //    base.DisplayName = "MainViewModel";
+        //    StatusVM = new StatusViewModel(this);
+        //    StatusVM.Add("Ready");
+        //    UserVM = new UserViewModel();
+        //    SpectraVM = new SpectraViewModel(this);
+
+        //    CommandToggleContinuousScan = new RelayCommand(parm => ToggleContinuousScan(),
+        //        cc => Connected && !_measurementActive && !ResultReady && !CoverMoving);
+        //    CommandMeasure = new RelayCommand(parm => Measure(parm));
+        //    CommandUpload = new RelayCommand(parm => Upload(),
+        //        cc => Connected && ResultReady);
+        //    CommandCancelResult = new RelayCommand(parm => CloseResult(),
+        //        cc => Connected && ResultReady);
+
+        //    CommandOpenCover = new RelayCommand(parm => OpenCover(),
+        //        cc => Connected && !_measurementActive && !ResultReady);
+        //    CommandCloseCover = new RelayCommand(parm => CloseCover(),
+        //        cc => Connected && !_measurementActive && !ResultReady);
+
+
+        //    _gia405Service = new Gia405Service();
+        //    _cover = new Cover(_gia405Service);
+
+        //    var bw = new BackgroundWorker();
+        //    bw.DoWork += ConnectTo405Service;
+        //    bw.RunWorkerCompleted += ConnectTo405ServiceComplete;
+        //    bw.RunWorkerAsync();
+        //    StatusVM.Add("Trying to connect...");
+
+        //}
+
+
+        #region connect_to_service
+        #region ddi_service_status
+        struct DPLStatus
+        {
+            public string Version;
+            public string Device;
+        }
+        //bool GetDeviceNameFromDDIService()
+        //{
+        //    bool result = false;
+        //    var dplStatus = new DPLStatus();
+
+        //    try
+        //    {
+        //        string rootUrl = Properties.Settings.Default.DDIServiceStatusUrl;
+
+        //        var request = System.Net.WebRequest.Create(rootUrl) as System.Net.HttpWebRequest;
+        //        request.Method = "GET";
+        //        request.ContentType = "application/json";
+        //        request.Accept = "application/json";
+        //        var httpStatusCode = System.Net.HttpStatusCode.BadRequest;
+
+
+        //        // Get response 
+        //        using (var response = request.GetResponse() as System.Net.HttpWebResponse)
+        //        {
+        //            httpStatusCode = response.StatusCode;
+        //            Stream ResponseStream = response.GetResponseStream();
+        //            string responseBody = ((new StreamReader(ResponseStream)).ReadToEnd());
+        //            dplStatus = Newtonsoft.Json.JsonConvert.DeserializeObject<DPLStatus>(responseBody);
+        //        }
+
+        //        if (httpStatusCode == System.Net.HttpStatusCode.OK)
+        //        {
+        //            DeviceName = dplStatus.Device;
+        //            result = true;
+        //        }
+        //        else
+        //        {
+        //            DeviceName = "Unknown";
+        //            result = false;
+        //        }
+        //    }
+        //    catch (System.Net.WebException ex)
+        //    {
+        //        DeviceName = "Unknown";
+        //        result = false;
+        //    }
+        //    catch (Exception e)
+        //    {
+        //        DeviceName = "Unknown";
+        //        result = false;
+        //    }
+
+        //    return result;
+
+        //}
+        #endregion
+        void ConnectTo405Service(object sender, DoWorkEventArgs e)
+        {
+            try
+            {
+                if (_gia405Service.Reset() == Gia405ServiceLib.Gia405ServiceReference.GIAMELEE405_RESULT.SUCCESS)
+                {
+                    //App.Current.Dispatcher.Invoke(new Action(() =>
+                    //{
+                    //    Connected = true;
+                    //}));
+                    Connected = true;
+                    DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Connected", null));
+                    EventBus.Instance.PostEvent(eb);
+                    e.Result = true;
+                }
+            }
+            catch (Exception ex)
+            {
+
+            }
+        }
+        void ConnectTo405ServiceComplete(object sender, RunWorkerCompletedEventArgs e)
+        {
+            bool? result = (bool?)e.Result;
+
+            if (result != true)
+            {
+                //System.Windows.MessageBox.Show("Could not connect to the 405 service.  Measurement will be disabled.",
+                //    "ERROR", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Could not connect to the 405 service.  Measurement will be disabled.", null));
+                EventBus.Instance.PostEvent(eb);
+            }
+            else
+            {
+                if (_cover.Init())
+                {
+                    if (_cover.Closed() == true)
+                        _cover.Open();
+                }
+                else
+                {
+                    //System.Windows.MessageBox.Show("Could not initialize Cover controller.  Cover open/close may not work.",
+                    //    "WARNING", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                    DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Could not initialize Cover controller.  Cover open/close may not work.", null));
+                    EventBus.Instance.PostEvent(eb);
+                }
+
+                //if (!GetDeviceNameFromDDIService())
+                //{
+                //    System.Windows.MessageBox.Show("Could not get the device name from the DDI service.",
+                //        "WARNING", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                //}
+            }
+
+            //StatusVM.Remove("Trying to connect...");
+            //System.Windows.Input.CommandManager.InvalidateRequerySuggested();
+
+        }
+        #endregion
+
+        #region continuous_scan
+        ManualResetEvent _stopScanning = new ManualResetEvent(false);
+        void ToggleContinuousScan()
+        {
+            if (Scanning)
+            {
+                _stopScanning.Set();
+            }
+            else
+            {
+                _stopScanning.Reset();
+
+                var bw = new BackgroundWorker();
+                bw.DoWork += ContinuousScanDoWork;
+                bw.RunWorkerCompleted += ContinuousScanComplete;
+                //bw.ProgressChanged += ContinousScanReportProgress;
+                //bw.WorkerReportsProgress = true;
+                bw.RunWorkerAsync();
+                Scanning = true;
+                //StatusVM.Add("Scanning...");
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Scanning...", null));
+                EventBus.Instance.PostEvent(eb);
+            }
+        }
+        void ContinuousScanDoWork(object sender, DoWorkEventArgs e)
+        {
+            try
+            {
+                List<double> intTimes = new List<double>() { 100 };
+                List<ushort> numAvgs = new List<ushort>() { 1 };
+                double[] wl = new double[0];
+                double[][] countsList = new double[0][];
+                List<double> counts;
+
+                //SpectraVM.CreateSpectra(intTimes.Count);
+
+                while (true)
+                {
+                    if (_stopScanning.WaitOne(100))
+                        break; //
+
+                    var res = _gia405Service.GetSpectra(null, intTimes, numAvgs, out wl, out countsList);
+                    if (res != Gia405ServiceLib.Gia405ServiceReference.GIAMELEE405_RESULT.SUCCESS)
+                        throw new Exception(res.ToString());
+
+                    //List<object> spect = new List<object>();
+                    //spect.Add(wl);
+                    //spect.Add(countsList);
+                    //((BackgroundWorker)sender).ReportProgress(0, spect);
+                    SpectraVM.UpdateSpectra(wl, countsList);
+
+                    counts = countsList.First().ToList();
+
+                    Spectrum spectrum = new Spectrum(wl.Zip(counts, (x, y) => new Point(x, y)).ToList());
+                    if (spectrum.IsSaturated(wl.First(), wl.Last()))
+                    {
+                        intTimes[0] = intTimes[0] / 2;
+                        if (intTimes[0] < 0.03)
+                            intTimes[0] = 0.03;
+
+                        continue;
+                    }
+
+                    intTimes[0] *= Math.Round(spectrum.SaturationThreshold / counts.Max(), 2);
+                    if (intTimes[0] >= 100)
+                        intTimes[0] = 100;
+
+                }
+            }
+            catch (Exception ex)
+            {
+                //MessageBox.Show(ex.ToString());
+                e.Result = ex.Message;
+            }
+        }
+
+        //void ContinousScanReportProgress(object sender, ProgressChangedEventArgs e)
+        //{
+        //    var dataPacket = e.UserState as List<object>;
+        //    SpectraVM.UpdateSpectra((double[])dataPacket[0], (double[][])dataPacket[1]);
+        //}
+        void ContinuousScanComplete(object sender, RunWorkerCompletedEventArgs e)
+        {
+            //StatusVM.Remove("Scanning...");
+            Scanning = false;
+
+            if (e.Result != null)
+            {
+                //System.Windows.MessageBox.Show("Error during continuous scan", "Scan Error", System.Windows.MessageBoxButton.OK,
+                //    System.Windows.MessageBoxImage.Error);
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Error during continuous scan", null));
+                EventBus.Instance.PostEvent(eb);
+            }
+
+            //System.Windows.Input.CommandManager.InvalidateRequerySuggested();
+
+        }
+        #endregion
+
+
+        #region cover_open/close
+        void OpenCover()
+        {
+            var bw = new BackgroundWorker();
+            bw.DoWork += CoverDoWork;
+            bw.RunWorkerCompleted += CoverWorkComplete;
+            bw.RunWorkerAsync(true);
+
+            CoverMoving = true;
+        }
+
+        void CloseCover()
+        {
+            var bw = new BackgroundWorker();
+            bw.DoWork += CoverDoWork;
+            bw.RunWorkerCompleted += CoverWorkComplete;
+            bw.RunWorkerAsync(false);
+
+            CoverMoving = true;
+        }
+
+        void CoverDoWork(object sender, DoWorkEventArgs e)
+        {
+            try
+            {
+                var openCover = e.Argument as bool?;
+
+                if (openCover == true)
+                {
+                    if (!_cover.Open())
+                        throw new Exception("Error trying to open cover");
+
+                    Thread.Sleep(2000);
+                    if (_cover.Closed() == true)
+                        throw new Exception("Timed out waiting for cover to open");
+                }
+                else
+                {
+                    if (!_cover.Close())
+                        throw new Exception("Error trying to close cover");
+                    int coverCloseIndex = 0;
+                    for (coverCloseIndex = 0; coverCloseIndex < 20; coverCloseIndex++)
+                    {
+                        Thread.Sleep(100);
+                        if (_cover.Closed() == true)
+                            break;
+                    }
+                    if (coverCloseIndex == 20)
+                        throw new Exception("Timed out waiting for cover to close");
+                }
+            }
+            catch (Exception ex)
+            {
+                //MessageBox.Show(ex.Message);
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(eb);
+            }
+        }
+        void CoverWorkComplete(object sender, RunWorkerCompletedEventArgs e)
+        {
+            CoverMoving = false;
+            //System.Windows.Input.CommandManager.InvalidateRequerySuggested();
+        }
+        #endregion
+
+        #region measure
+        bool _measurementActive;
+        void Measure(object window)
+        {
+            if (AppSettings.Instance.ControlNumberCheck && !IsControlNumberValid(ControlNumber))
+            {
+                MessageBox.Show(ControlNumber + " is not valid.\r\nPlease enter a valid control number.", "12 digit control number required");
+                ControlNumber = "";
+                return;
+            }
+            _measurementActive = true;
+            //StatusVM.Add("Measurement active");
+            //System.Diagnostics.Debug.WriteLine(ControlNumber);
+            DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Measurement active", null));
+            EventBus.Instance.PostEvent(eb);
+
+            var bw = new BackgroundWorker();
+            bw.DoWork += MeasureDoWork;
+            bw.RunWorkerCompleted += MeasureComplete;
+            bw.RunWorkerAsync(window);
+        }
+
+        void MeasureDoWork(object sender, DoWorkEventArgs e)
+        {
+            List<object> results = new List<object>();
+            results.Add(e.Argument);
+            try
+            {
+                #region close_cover
+                if (!_cover.Close())
+                    throw new Exception("Error trying to close cover");
+                int coverCloseIndex = 0;
+                for (coverCloseIndex = 0; coverCloseIndex < 30; coverCloseIndex++)
+                {
+                    Thread.Sleep(100);
+                    if (_cover.Closed() == true)
+                        break;
+                }
+                if (coverCloseIndex == 30)
+                    throw new Exception("Timed out waiting for cover to close");
+                #endregion
+
+                Thread.Sleep(AppSettings.Instance.LaserWaitDelayMilliSeconds);
+
+
+                List<double> intTimes = AppSettings.Instance.INTEGRATION_TIMES_MS.Split(',').Select(x => double.Parse(x)).ToList();
+                List<ushort> numAvgs = AppSettings.Instance.NUM_TO_AVERAGE.Split(',').Select(x => UInt16.Parse(x)).ToList();
+                double[] wl = new double[0];
+                double[][] countsList = new double[0][];
+
+                for (int tries = 0; tries < 3; tries++)
+                {
+                    SpectraVM.CreateSpectra(intTimes.Count);
+
+                    var res = _gia405Service.GetSpectra(null, intTimes, numAvgs, out wl, out countsList);
+                    if (res != Gia405ServiceLib.Gia405ServiceReference.GIAMELEE405_RESULT.SUCCESS)
+                        throw new Exception(res.ToString());
+
+                    bool? diamondDetected = null; int diamondPeakCount = -1;
+                    bool? _468Detected = null, _737Detected = null;
+                    double integrationTimeUsed = -1;
+                    DPLAnalyzer.DPL_ANALYZER_RESULT result = DPLAnalyzer.DPL_ANALYZER_RESULT.ERROR;
+
+                    SpectraVM.UpdateSpectra(wl, countsList);
+
+                    result = SpectraVM.AnalyzeSpectra(intTimes, wl, countsList,
+                        out diamondDetected, out diamondPeakCount,
+                                        out _468Detected, out _737Detected, out integrationTimeUsed);
+
+                    if (!SpectraVM.SaveSpectra(ControlNumber, (result == DPLAnalyzer.DPL_ANALYZER_RESULT.NO_CVD_DETECTED), wl,
+                        countsList, intTimes.Select(i => i.ToString()).ToList()))
+                        throw new Exception("Error saving data");
+
+                    results.Add(result);
+
+                    results.Add(diamondDetected);
+                    results.Add(diamondPeakCount);
+                    results.Add(_468Detected);
+                    results.Add(_737Detected);
+                    results.Add(integrationTimeUsed);
+
+                    if (tries == 0 && result != DPLAnalyzer.DPL_ANALYZER_RESULT.CVD_SYNTHETIC_DIAMOND)
+                    {
+                        break;
+                    }
+                    else if (tries == 1 && result == DPLAnalyzer.DPL_ANALYZER_RESULT.CVD_SYNTHETIC_DIAMOND)
+                    {
+                        break;
+                    }
+                }
+
+
+                e.Result = results;
+            }
+            catch (Exception ex)
+            {
+                //MessageBox.Show(ex.ToString());
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, ex.Message, null));
+                EventBus.Instance.PostEvent(eb);
+            }
+        }
+
+        void MeasureComplete(object sender, RunWorkerCompletedEventArgs e)
+        {
+            //StatusVM.Remove("Measurement active");
+
+            string logResultDescription = "ERROR DURING MEASURMENT";
+
+            if (e.Result != null)
+            {
+                ResultReady = true;
+
+                List<object> results = e.Result as List<object>;
+
+
+                if ((DPLAnalyzer.DPL_ANALYZER_RESULT)results[1] == DPLAnalyzer.DPL_ANALYZER_RESULT.NO_CVD_DETECTED)
+                {
+                    LegendContent = "PASS";
+                    LegendDescription = "";//[No CVD features detected]";
+                    logResultDescription = LegendContent;
+                }
+                else
+                {
+                    LegendContent = "REFER";
+                    LegendDescription = "";
+                    logResultDescription = LegendContent;
+                    if ((DPLAnalyzer.DPL_ANALYZER_RESULT)results[1] == DPLAnalyzer.DPL_ANALYZER_RESULT.ERROR)
+                    {
+                        LegendDescription = "Measure again.";
+                        logResultDescription += " [" + LegendDescription + "]";
+                    }
+                }
+
+                //GlobalVariables.measurementLog.Debug(ControlNumber +
+                //                ", " + DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") +
+                //                ", " + DeviceName +
+                //                ", " + logResultDescription +
+                //                ", " + (((bool?)results[2] == true) ? (int)results[3] : 0) +
+                //                ", " + (((bool?)results[4] == true) ? "TRUE" : "FALSE") +
+                //                ", " + (((bool?)results[5] == true) ? "TRUE" : "FALSE") +
+                //                ", " + (double)results[6]);
+
+                string msg = ControlNumber +
+                                ", " + DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") +
+                                ", " + DeviceName +
+                                ", " + logResultDescription +
+                                ", " + (((bool?)results[2] == true) ? (int)results[3] : 0) +
+                                ", " + (((bool?)results[4] == true) ? "TRUE" : "FALSE") +
+                                ", " + (((bool?)results[5] == true) ? "TRUE" : "FALSE") +
+                                ", " + (double)results[6];
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, msg, null));
+                EventBus.Instance.PostEvent(eb);
+            }
+            else
+            {
+                //System.Windows.MessageBox.Show("Error during measurement", "Measurement Error", System.Windows.MessageBoxButton.OK,
+                //    System.Windows.MessageBoxImage.Error);
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Error during measurement", null));
+                EventBus.Instance.PostEvent(eb);
+
+                CloseResult();
+            }
+
+            //System.Windows.Input.CommandManager.InvalidateRequerySuggested();
+
+        }
+        #endregion
+
+
+        void CloseResult()
+        {
+            //SpectraVM.ClearSpectra();
+            LegendContent = "";
+            LegendDescription = "";
+
+            ResultReady = false;
+            _measurementActive = false;
+
+            if (!_cover.Open())
+            {
+                //System.Windows.MessageBox.Show("Error trying to open cover", "Cover Opening Error", System.Windows.MessageBoxButton.OK,
+                //    System.Windows.MessageBoxImage.Error);
+
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Error trying to open cover", null));
+                EventBus.Instance.PostEvent(eb);
+            }
+
+            IsControlNumberFocused = false;
+            IsControlNumberFocused = true;
+            ControlNumber = "";
+        }
+
+        bool IsControlNumberValid(string cn)
+        {
+            try
+            {
+                bool res = false;
+                long number = 0;
+                res = cn != null && long.TryParse(cn, out number) && cn.Length == 12;
+
+                return res;
+            }
+            catch
+            {
+
+            }
+
+            return false;
+        }
+
+        #region Upload
+        void Upload()
+        {
+            if (!Uploading)
+            {
+                if (!IsControlNumberValid(ControlNumber))
+                {
+                    //MessageBox.Show("Please ensure that a valid control number has been entered", "Invalid Control Number");
+                    DeviceEvent ee = new DeviceEvent("DPL", new DPLEvent(EventType.Error, "Invalid Control Number", null));
+                    EventBus.Instance.PostEvent(ee);
+                    IsControlNumberFocused = false;
+                    IsControlNumberFocused = true;
+                    return;
+                }
+                Uploading = true;
+                //StatusVM.Add("Uploading to Spectrum...");
+                DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Uploading to Spectrum...", null));
+                EventBus.Instance.PostEvent(eb);
+
+                var bw = new BackgroundWorker();
+                bw.DoWork += UploadDoWork;
+                bw.RunWorkerCompleted += UploadComplete;
+                bw.RunWorkerAsync(ControlNumber + "," + LegendContent + "," + ControlNumber); // user name to controlnumber
+            }
+            else
+            {
+                var bw = new BackgroundWorker();
+                bw.DoWork += CancelUploadDoWork;
+                bw.RunWorkerAsync();
+            }
+        }
+
+        void UploadDoWork(object sender, DoWorkEventArgs e)
+        {
+            e.Result = "Upload Error: An error occured during upload";
+
+            try
+            {
+                bool uploaded = false;
+                while (true)
+                {
+                    using (NamedPipeServerStream pipeServer =
+                        new NamedPipeServerStream("GIA_DPL_PIPE_PROD", PipeDirection.InOut))
+                    {
+                        pipeServer.WaitForConnection();
+                        using (StreamReader sr = new StreamReader(pipeServer))
+                        using (StreamWriter sw = new StreamWriter(pipeServer))
+                        {
+                            var message = sr.ReadLine().Split(',');
+                            switch (message.First())
+                            {
+                                case "GETDATA":
+                                    sw.WriteLine(e.Argument as string);
+                                    sw.Flush();
+                                    uploaded = true;
+                                    break;
+                                case "ACKNOWLEDGE":
+                                    if (uploaded)
+                                    {
+                                        var pkt = "Unexpected Status";
+                                        var status = message[1];
+                                        var cn = message[2];
+
+                                        var parms = ((string)e.Argument).Split(',');
+
+                                        if (cn != parms[0])
+                                        {
+                                            pkt = "Control number mismatch, expected " + parms[0] +
+                                                ", got " + cn;
+                                            sw.WriteLine(pkt);
+                                            sw.Flush();
+                                            //e.Result = pkt;
+                                            //return;
+                                        }
+                                        else
+                                        {
+                                            if (status.ToUpper() == "SAVED")
+                                            {
+                                                pkt = "Acknowledge";
+                                                e.Result = "Data saved to Spectrum";
+                                            }
+                                            else
+                                            {
+                                                pkt = "Unexpected Status: " + status;
+                                                e.Result = "Unexpected status response : " + status;
+                                            }
+                                            sw.WriteLine(pkt);
+                                            sw.Flush();
+                                            return;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        sw.WriteLine("ERROR: ACK WAS NOT EXPECTED");
+                                        sw.Flush();
+                                    }
+                                    break;
+                                case "CANCEL":
+                                default:
+                                    if (!uploaded)
+                                        e.Result = "Cancelled successfully before Spectrum upload.";
+                                    else
+                                        e.Result = "Cancelled after Spectrum upload but before Spectrum save acknowledge.\n\r" +
+                                            "Please check Spectrum to confirm if the data was saved.";
+                                    return;
+                            }
+
+                        }
+
+                    }
+                }
+
+            }
+            catch (Exception ex)
+            {
+                e.Result = "Upload Error: " + ex.Message;
+            }
+
+        }
+        void UploadComplete(object sender, RunWorkerCompletedEventArgs e)
+        {
+            Uploading = false;
+            //StatusVM.Remove("Uploading to Spectrum...");
+
+            var result = e.Result as string;
+
+            //MessageBox.Show(App.Current.MainWindow, result, "Upload Result");
+            DeviceEvent eb = new DeviceEvent("DPL", new DPLEvent(EventType.Info, "Upload Result: " + result, null));
+            EventBus.Instance.PostEvent(eb);
+
+            if (result == "Data saved to Spectrum")
+                CloseResult();
+        }
+
+        void CancelUploadDoWork(object sender, DoWorkEventArgs e)
+        {
+            using (NamedPipeClientStream pipeClient =
+                                    new NamedPipeClientStream(".", "GIA_DPL_PIPE_PROD", PipeDirection.Out))
+            {
+                try
+                {
+                    pipeClient.Connect(50);
+                    using (StreamWriter sw = new StreamWriter(pipeClient))
+                    {
+                        sw.WriteLine("CANCEL");
+                        sw.Flush();
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    //MessageBox.Show(ex.Message, "CANCEL ERROR");
+                }
+            }
+
+
+        }
+
+        #endregion
+
+
+
+
+        //public void OnWindowClosing(object sender, CancelEventArgs e)
+        //{
+        //    try
+        //    {
+        //        if (!Connected)
+        //            return;
+
+        //        if (_cover.Closed() == true)
+        //            return;
+
+        //        e.Cancel = true; //cancel closing until door is closed
+
+        //        //StatusVM.Add("Trying to close cover...");
+        //        var bw = new BackgroundWorker();
+        //        bw.DoWork += WindowClosingDoWork;
+        //        bw.RunWorkerCompleted += WindowClosingComplete;
+        //        bw.RunWorkerAsync();
+
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        MessageBox.Show(ex.Message);
+        //    }
+
+        //}
+
+        //void WindowClosingDoWork(object sender, DoWorkEventArgs e)
+        //{
+        //    try
+        //    {
+        //        if (!_cover.Close())
+        //            throw new Exception("Error trying to close cover");
+        //        int coverCloseIndex = 0;
+        //        for (coverCloseIndex = 0; coverCloseIndex < 20; coverCloseIndex++)
+        //        {
+        //            Thread.Sleep(100);
+        //            if (_cover.Closed() == true)
+        //                break;
+        //        }
+        //        if (coverCloseIndex == 20)
+        //            throw new Exception("Timed out waiting for cover to close");
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        MessageBox.Show(ex.Message);
+        //    }
+
+        //}
+        //void WindowClosingComplete(object sender, RunWorkerCompletedEventArgs e)
+        //{
+        //    App.Current.Shutdown();
+        //}
+    }
+}

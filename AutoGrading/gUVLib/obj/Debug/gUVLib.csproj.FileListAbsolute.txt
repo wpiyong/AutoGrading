@@ -1,0 +1,11 @@
+C:\work\AutoGrading\AutoGrading\gUVLib\obj\Debug\gUVLib.csprojAssemblyReference.cache
+C:\work\AutoGrading\AutoGrading\gUVLib\obj\Debug\gUVLib.csproj.CoreCompileInputs.cache
+C:\work\AutoGrading\AutoGrading\gUVLib\bin\Debug\gUVLib.dll
+C:\work\AutoGrading\AutoGrading\gUVLib\bin\Debug\gUVLib.pdb
+C:\work\AutoGrading\AutoGrading\gUVLib\bin\Debug\Newtonsoft.Json.dll
+C:\work\AutoGrading\AutoGrading\gUVLib\bin\Debug\SettingsLib.dll
+C:\work\AutoGrading\AutoGrading\gUVLib\bin\Debug\Newtonsoft.Json.xml
+C:\work\AutoGrading\AutoGrading\gUVLib\bin\Debug\SettingsLib.pdb
+C:\work\AutoGrading\AutoGrading\gUVLib\obj\Debug\gUVLib.csproj.CopyComplete
+C:\work\AutoGrading\AutoGrading\gUVLib\obj\Debug\gUVLib.dll
+C:\work\AutoGrading\AutoGrading\gUVLib\obj\Debug\gUVLib.pdb
