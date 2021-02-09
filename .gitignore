@@ -1,2 +1,13 @@
-obj/
-bin/
+AutoGrading/AutoGrading/bin/
+AutoGrading/AutoGrading/obj/
+AutoGrading/DplLib/bin/
+AutoGrading/DplLib/obj/
+AutoGrading/FTIRLib/bin/
+AutoGrading/FTIRLib/obj/
+AutoGrading/gColorLib/bin/
+AutoGrading/gColorLib/obj/
+AutoGrading/gUVLib/bin/
+AutoGrading/gUVLib/obj/
+AutoGrading/UtilsLib/bin/
+AutoGrading/UtilsLib/obj/
+
